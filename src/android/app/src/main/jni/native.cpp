@@ -954,6 +954,26 @@ jdoubleArray Java_org_citra_citra_1emu_NativeLibrary_getPerfStats(JNIEnv* env,
                            results.time_remaining};
 
         env->SetDoubleArrayRegion(j_stats, 0, 9, stats);
+
+        // Rate-limited diagnostic dump for perf analysis on weak SoCs. Emits
+        // one logcat line per ~1 wall second describing where the emulation
+        // thread's budget is going. Filterable with `adb logcat | grep PerfProbe`.
+        // The values are walltime seconds *per emulated vblank interval*, so
+        // sum-to-time_vblank_interval and comparing each to 16.67ms (= 60Hz
+        // budget) shows which category blew past the budget.
+        static auto last_log = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log).count() >= 1000) {
+            last_log = now;
+            const double frame_ms = results.time_vblank_interval * 1000.0;
+            LOG_INFO(Frontend,
+                     "PerfProbe speed={:.1f}% sysFPS={:.1f} gameFPS={:.1f} frame={:.2f}ms "
+                     "[svc={:.2f} ipc={:.2f} gpu={:.2f} swap={:.2f} rest={:.2f}]",
+                     results.emulation_speed * 100.0, results.system_fps, results.game_fps,
+                     frame_ms, results.time_hle_svc * 1000.0, results.time_hle_ipc * 1000.0,
+                     results.time_gpu * 1000.0, results.time_swap * 1000.0,
+                     results.time_remaining * 1000.0);
+        }
     }
 
     return j_stats;
