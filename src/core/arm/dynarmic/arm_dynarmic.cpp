@@ -6,7 +6,9 @@
 #include <dynarmic/interface/A32/a32.h>
 #include <dynarmic/interface/optimization_flags.h>
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/microprofile.h"
+#include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_cp15.h"
 #include "core/arm/dynarmic/arm_exclusive_monitor.h"
@@ -313,6 +315,35 @@ std::unique_ptr<Dynarmic::A32::Jit> ARM_Dynarmic::MakeJit() {
     // Multi-process state
     config.processor_id = GetID();
     config.global_monitor = &exclusive_monitor.monitor;
+
+    // ARM11 dynarec accuracy. When CpuAccuracy::Fast is selected, enable
+    // Dynarmic's unsafe FP optimization bundle. Concretely this means:
+    //
+    //   * Unsafe_ReducedErrorFP — allows slightly less-precise transcendental
+    //     and division results than IEEE-754 strictly mandates.
+    //   * Unsafe_InaccurateNaN — skips producing bit-exact NaN payloads.
+    //   * Unsafe_IgnoreStandardFPCRValue — the big one. Lets the JIT emit
+    //     native AArch64 NEON FP instructions without honouring the emulated
+    //     FPCR rounding mode on every op, which is the dominant cost of ARM11
+    //     FP emulation on weak in-order cores like Cortex-A55.
+    //
+    // Unsafe_UnfuseFMA is intentionally NOT enabled — it trades accuracy for
+    // speed only on hosts lacking hardware FMA. All 64-bit ARM cores we care
+    // about already have FMA, so enabling it would just reduce precision for
+    // no benefit.
+    //
+    // Unsafe_IgnoreGlobalMonitor is also NOT enabled — the 3DS has two ARM11
+    // cores that synchronise via LDREX/STREX and dropping the global monitor
+    // risks deadlocks in multithreaded games.
+    if (Settings::values.cpu_accuracy.GetValue() == Settings::CpuAccuracy::Fast) {
+        config.unsafe_optimizations = true;
+        config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP;
+        config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
+        config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue;
+        LOG_INFO(Core_ARM, "Dynarmic: CpuAccuracy=Fast (unsafe FP optimizations enabled)");
+    } else {
+        LOG_INFO(Core_ARM, "Dynarmic: CpuAccuracy=Accurate (safe optimizations only)");
+    }
 
     return std::make_unique<Dynarmic::A32::Jit>(config);
 }

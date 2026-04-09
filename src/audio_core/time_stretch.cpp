@@ -66,28 +66,43 @@ std::size_t TimeStretcher::Process(const s16* in, std::size_t num_in, s16* out,
               backlog_fullness);
 
     if constexpr (std::is_floating_point<soundtouch::SAMPLETYPE>()) {
-        // The SoundTouch library on most systems expects float samples
-        // use this vector to store input if soundtouch::SAMPLETYPE is a float
-        std::vector<soundtouch::SAMPLETYPE> float_in(2 * num_in);
-        std::vector<soundtouch::SAMPLETYPE> float_out(2 * num_out);
-
-        for (std::size_t i = 0; i < (2 * num_in); i++) {
-            // Conventional integer PCM uses a range of -32768 to 32767,
-            // but float samples use -1 to 1
-            // As a result we need to scale sample values during conversion
-            const float temp = static_cast<float>(in[i]) / std::numeric_limits<s16>::max();
-            float_in[i] = static_cast<soundtouch::SAMPLETYPE>(temp);
+        // SoundTouch on most systems expects float samples. Use persistent
+        // member-owned scratch buffers rather than per-call std::vector
+        // construction — on weak handheld SoCs (Cortex-A55) those heap calls
+        // showed up as a real chunk of the audio thread's budget.
+        static_assert(sizeof(soundtouch::SAMPLETYPE) == sizeof(float),
+                      "TimeStretcher scratch buffers assume float SAMPLETYPE");
+        if (float_scratch_in.size() < 2 * num_in) {
+            float_scratch_in.resize(2 * num_in);
+        }
+        if (float_scratch_out.size() < 2 * num_out) {
+            float_scratch_out.resize(2 * num_out);
         }
 
-        sound_touch->putSamples(float_in.data(), static_cast<u32>(num_in));
+        // Precompute the s16 → float scale factor once so the inner loop is
+        // a hot multiply-only sequence rather than a divide-per-sample; A55
+        // FDIV latency is ~14 cycles whereas FMUL is ~3.
+        constexpr float kS16ToFloat = 1.0f / 32768.0f;
+        constexpr float kFloatToS16 = 32767.0f;
 
-        const std::size_t samples_received =
-            sound_touch->receiveSamples(float_out.data(), static_cast<u32>(num_out));
+        for (std::size_t i = 0; i < (2 * num_in); ++i) {
+            float_scratch_in[i] = static_cast<float>(in[i]) * kS16ToFloat;
+        }
 
-        // Converting output samples back to shorts so we can use them
-        for (std::size_t i = 0; i < (2 * num_out); i++) {
-            const s16 temp = static_cast<s16>(float_out[i] * std::numeric_limits<s16>::max());
-            out[i] = temp;
+        sound_touch->putSamples(reinterpret_cast<soundtouch::SAMPLETYPE*>(float_scratch_in.data()),
+                                static_cast<u32>(num_in));
+
+        const std::size_t samples_received = sound_touch->receiveSamples(
+            reinterpret_cast<soundtouch::SAMPLETYPE*>(float_scratch_out.data()),
+            static_cast<u32>(num_out));
+
+        // Convert back to s16 with saturation so loud peaks don't wrap.
+        const std::size_t out_samples = 2 * samples_received;
+        for (std::size_t i = 0; i < out_samples; ++i) {
+            float v = float_scratch_out[i] * kFloatToS16;
+            if (v > 32767.0f) v = 32767.0f;
+            else if (v < -32768.0f) v = -32768.0f;
+            out[i] = static_cast<s16>(v);
         }
 
         return samples_received;

@@ -84,6 +84,7 @@ void LogSettings() {
 
     LOG_INFO(Config, "Azahar Configuration:");
     log_setting("Core_UseCpuJit", values.use_cpu_jit.GetValue());
+    log_setting("Core_CpuAccuracy", static_cast<u32>(values.cpu_accuracy.GetValue()));
     log_setting("Core_CPUClockPercentage", values.cpu_clock_percentage.GetValue());
     log_setting("Controller_UseArticController", values.use_artic_base_controller.GetValue());
     log_setting("Renderer_UseGLES", values.use_gles.GetValue());
@@ -198,6 +199,7 @@ void RestoreGlobalState(bool is_powered_on) {
 
     // Core
     values.cpu_clock_percentage.SetGlobal(true);
+    values.cpu_accuracy.SetGlobal(true);
     values.is_new_3ds.SetGlobal(true);
     values.lle_applets.SetGlobal(true);
 

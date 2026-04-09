@@ -299,6 +299,10 @@
     <string name="android_hide_images_description">Prevent 3DS camera, screenshot, and custom texture images from being indexed by Android and displayed in the gallery. Your device may need to be rebooted after changing this setting to take effect.</string>
     <string name="turbo_limit">Turbo Speed Limit</string>
     <string name="turbo_limit_description">Emulation speed limit used while the turbo hotkey is active.</string>
+    <string name="cpu_accuracy">CPU Accuracy</string>
+    <string name="cpu_accuracy_description">Controls how strictly the ARM11 dynarec honours native floating-point and NaN semantics. \"Fast\" unlocks unsafe FP optimizations inside Dynarmic and is the single biggest ARM11 dynarec win on weak mobile SoCs — the JIT can emit native NEON FP directly without honouring the emulated FPCR rounding mode. No known commercial 3DS game is visibly affected, but in principle it can produce slightly different FP results. Changes take effect on the next game launch.</string>
+    <string name="cpu_accuracy_accurate">Accurate (Safe)</string>
+    <string name="cpu_accuracy_fast">Fast (Unsafe FP — Recommended)</string>
     <string name="frame_skip">Frame Skip</string>
     <string name="frame_skip_description">Skips presenting every Nth emulated frame to the display to save CPU/GPU work on weaker devices. Emulated timing, physics and audio are unaffected. 0 = present every frame, 1 = present every other frame (~30 FPS), 2 = present one of every three frames, etc.</string>
     <string name="frame_skip_mode">Frame Skip Mode</string>

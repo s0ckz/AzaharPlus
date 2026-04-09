@@ -1795,6 +1795,17 @@ class SettingsFragmentPresenter(private val fragmentView: SettingsFragmentView) 
                 )
             )
             add(
+                SingleChoiceSetting(
+                    IntSetting.CPU_ACCURACY,
+                    R.string.cpu_accuracy,
+                    R.string.cpu_accuracy_description,
+                    R.array.cpuAccuracyModes,
+                    R.array.cpuAccuracyModeValues,
+                    IntSetting.CPU_ACCURACY.key,
+                    IntSetting.CPU_ACCURACY.defaultValue
+                )
+            )
+            add(
                 SwitchSetting(
                     BooleanSetting.HW_SHADER,
                     R.string.hw_shaders,

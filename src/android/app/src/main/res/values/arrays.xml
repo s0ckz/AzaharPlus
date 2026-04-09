@@ -238,6 +238,16 @@
         <item>4</item>
     </integer-array>
 
+    <string-array name="cpuAccuracyModes">
+        <item>@string/cpu_accuracy_accurate</item>
+        <item>@string/cpu_accuracy_fast</item>
+    </string-array>
+
+    <integer-array name="cpuAccuracyModeValues">
+        <item>0</item>
+        <item>1</item>
+    </integer-array>
+
     <string-array name="frameSkipModes">
         <item>@string/frame_skip_mode_present_only</item>
         <item>@string/frame_skip_mode_skip_draws</item>

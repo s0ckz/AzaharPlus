@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <memory>
+#include <vector>
 #include "common/common_types.h"
 
 namespace soundtouch {
@@ -36,6 +37,11 @@ public:
 private:
     std::unique_ptr<soundtouch::SoundTouch> sound_touch;
     double stretch_ratio = 1.0;
+    // Scratch buffers used when SoundTouch is compiled to take float samples.
+    // Pre-allocated once and resized on demand to avoid per-audio-frame heap
+    // allocations on weak handhelds (Cortex-A55 class).
+    std::vector<float> float_scratch_in;
+    std::vector<float> float_scratch_out;
 };
 
 } // namespace AudioCore

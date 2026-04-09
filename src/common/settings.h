@@ -127,6 +127,24 @@ enum class AspectRatio : u32 {
     Stretch = 5,
 };
 
+// Controls how strictly the ARM11 dynarec matches native behaviour. This maps
+// directly onto Dynarmic's optimization / unsafe_optimizations flags. "Fast"
+// unlocks unsafe FP optimizations that gain a large amount of performance on
+// weak in-order cores (Cortex-A55 etc.) at the cost of some floating-point
+// precision corners. No currently-known commercial 3DS game is visibly
+// affected, but it can in principle produce slightly different FP results.
+enum class CpuAccuracy : u32 {
+    // Stock behaviour: only the default safe Dynarmic optimizations are
+    // enabled. Highest fidelity, slowest.
+    Accurate = 0,
+    // Enables Dynarmic unsafe_optimizations plus Unsafe_ReducedErrorFP,
+    // Unsafe_InaccurateNaN and Unsafe_IgnoreStandardFPCRValue. This lets the
+    // JIT emit NEON FP directly without honouring the emulated FPCR rounding
+    // mode and with relaxed error / NaN semantics, which is the single
+    // biggest ARM11 dynarec win on low-end Android SoCs.
+    Fast = 1,
+};
+
 // Selects how aggressively the emulator skips work on skipped frames when
 // frame_skip > 0. Emulated timing (CPU, audio, GSP interrupts) is NEVER altered
 // by any of these modes — only host-side work is elided. Each mode is a strict
@@ -499,6 +517,13 @@ struct Values {
     // Core
     Setting<bool> use_cpu_jit{true, Keys::use_cpu_jit};
     SwitchableSetting<s32, true> cpu_clock_percentage{100, 5, 400, Keys::cpu_clock_percentage};
+    // Dynarmic accuracy. Defaults to Fast on Android (huge win on low-end
+    // mobile SoCs) and Accurate elsewhere.
+#ifdef ANDROID
+    SwitchableSetting<CpuAccuracy> cpu_accuracy{CpuAccuracy::Fast, Keys::cpu_accuracy};
+#else
+    SwitchableSetting<CpuAccuracy> cpu_accuracy{CpuAccuracy::Accurate, Keys::cpu_accuracy};
+#endif
     SwitchableSetting<bool> is_new_3ds{true, Keys::is_new_3ds};
     SwitchableSetting<bool> lle_applets{true, Keys::lle_applets};
     SwitchableSetting<bool> deterministic_async_operations{false,
@@ -651,7 +676,15 @@ struct Values {
     // Audio
     bool audio_muted;
     SwitchableSetting<AudioEmulation> audio_emulation{AudioEmulation::HLE, Keys::audio_emulation};
+    // SoundTouch time stretching is relatively CPU-heavy (per-frame float
+    // conversions and a sliding buffer). On desktop it's worth it for smooth
+    // audio under speed variance, but on weak Android handhelds the cost is
+    // a meaningful chunk of CPU — default it off there.
+#ifdef ANDROID
+    SwitchableSetting<bool> enable_audio_stretching{false, Keys::enable_audio_stretching};
+#else
     SwitchableSetting<bool> enable_audio_stretching{true, Keys::enable_audio_stretching};
+#endif
     SwitchableSetting<bool> enable_realtime_audio{false, Keys::enable_realtime_audio};
     SwitchableSetting<float, true> volume{1.f, 0.f, 1.f, Keys::volume};
     Setting<AudioCore::SinkType> output_type{AudioCore::SinkType::Auto, Keys::output_type};

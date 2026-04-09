@@ -48,6 +48,8 @@ enum class IntSetting(
     PORTRAIT_BOTTOM_HEIGHT(SettingKeys.custom_portrait_bottom_height(),Settings.SECTION_LAYOUT,480),
     AUDIO_INPUT_TYPE(SettingKeys.input_type(), Settings.SECTION_AUDIO, 0),
     CPU_CLOCK_SPEED(SettingKeys.cpu_clock_percentage(), Settings.SECTION_CORE, 100),
+    // Defaults to Fast (1) on Android to match the C++ default.
+    CPU_ACCURACY(SettingKeys.cpu_accuracy(), Settings.SECTION_CORE, 1),
     TEXTURE_FILTER(SettingKeys.texture_filter(), Settings.SECTION_RENDERER, 0),
     TEXTURE_SAMPLING(SettingKeys.texture_sampling(), Settings.SECTION_RENDERER, 0),
     USE_FRAME_LIMIT(SettingKeys.use_frame_limit(), Settings.SECTION_RENDERER, 1),

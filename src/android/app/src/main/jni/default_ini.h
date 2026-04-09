@@ -82,6 +82,16 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 # 0: Interpreter (slow), 1 (default): JIT (fast)
 )") DECLARE_KEY(use_cpu_jit) BOOST_HANA_STRING(R"(
 
+# Controls how strictly the ARM11 dynarec honours native FP / NaN semantics.
+# 0: Accurate - stock behaviour, bit-exact FP, slowest.
+# 1 (default on Android): Fast - enables Dynarmic's unsafe FP optimizations
+#    (ReducedErrorFP + InaccurateNaN + IgnoreStandardFPCRValue). This is the
+#    single biggest ARM11 dynarec win on weak mobile SoCs like RK3568 because
+#    the JIT can emit native NEON FP directly without emulating the FPCR
+#    rounding mode on every op. No known commercial 3DS game is visibly
+#    affected, but in principle it can produce slightly different FP results.
+)") DECLARE_KEY(cpu_accuracy) BOOST_HANA_STRING(R"(
+
 # Change the Clock Frequency of the emulated 3DS CPU.
 # Underclocking can increase the performance of the game at the risk of freezing.
 # Overclocking may fix lag that happens on console, but also comes with the risk of freezing.
