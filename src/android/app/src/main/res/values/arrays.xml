@@ -241,11 +241,13 @@
     <string-array name="frameSkipModes">
         <item>@string/frame_skip_mode_present_only</item>
         <item>@string/frame_skip_mode_skip_draws</item>
+        <item>@string/frame_skip_mode_skip_all_gpu</item>
     </string-array>
 
     <integer-array name="frameSkipModeValues">
         <item>0</item>
         <item>1</item>
+        <item>2</item>
     </integer-array>
 
     <string-array name="render3dModes">

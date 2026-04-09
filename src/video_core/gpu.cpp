@@ -357,9 +357,14 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
         return;
     }
 
-    // Perform memory fill.
-    if (!impl->rasterizer->AccelerateFill(config)) {
-        impl->sw_blitter->MemoryFill(config);
+    // Perform memory fill, unless the aggressive SkipAllGpu frame-skip mode
+    // has elected to drop this frame's GPU work entirely. We still fire the
+    // completion interrupt below so the game's GPU command processor keeps
+    // advancing normally.
+    if (!impl->skip_gpu_transfers) {
+        if (!impl->rasterizer->AccelerateFill(config)) {
+            impl->sw_blitter->MemoryFill(config);
+        }
     }
 
     // It seems that it won't signal interrupt if "address_start" is zero.
@@ -392,12 +397,19 @@ void GPU::MemoryTransfer() {
         impl->debug_context->OnEvent(Pica::DebugContext::Event::IncomingDisplayTransfer, nullptr);
     }
 
-    // Perform memory transfer
+    // Perform memory transfer.
+    //
+    // Texture copies are NEVER skipped even in the most aggressive frame-skip
+    // mode because they are commonly used for texture-cache / glyph-atlas
+    // updates whose results persist across frames. Non-texture-copy display
+    // transfers (render target → screen framebuffer copies) are elided on
+    // skipped frames in SkipAllGpu mode since we are not going to present
+    // that framebuffer anyway.
     if (config.is_texture_copy) {
         if (!impl->rasterizer->AccelerateTextureCopy(config)) {
             impl->sw_blitter->TextureCopy(config);
         }
-    } else {
+    } else if (!impl->skip_gpu_transfers) {
         if (right_eye_disabler->ShouldAllowDisplayTransfer(config.GetPhysicalInputAddress(),
                                                            config.input_height)) {
             if (!impl->rasterizer->AccelerateDisplayTransfer(config)) {
@@ -441,16 +453,21 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     impl->signal_interrupt(Service::GSP::InterruptId::PDC1);
 
     // (b) Decide whether the next frame will be skipped and propagate to the
-    // PicaCore when the aggressive mode is selected.
+    // PicaCore / GPU transfer paths according to the selected mode.
     impl->vblank_counter++;
     const u32 frame_skip = Settings::values.frame_skip.GetValue();
     const bool next_is_skip =
         (frame_skip > 0) && ((impl->vblank_counter % (frame_skip + 1)) != 0);
     impl->skip_current_present = next_is_skip;
 
-    const bool aggressive =
-        Settings::values.frame_skip_mode.GetValue() == Settings::FrameSkipMode::SkipDraws;
-    impl->pica.SetSkipDraws(next_is_skip && aggressive);
+    const auto mode = Settings::values.frame_skip_mode.GetValue();
+    // SkipAllGpu is a strict superset of SkipDraws, so both of these enable
+    // short-circuiting DrawArrays / DrawImmediate in the PICA core.
+    const bool skip_draws = next_is_skip && (mode == Settings::FrameSkipMode::SkipDraws ||
+                                              mode == Settings::FrameSkipMode::SkipAllGpu);
+    impl->pica.SetSkipDraws(skip_draws);
+    impl->skip_gpu_transfers =
+        next_is_skip && (mode == Settings::FrameSkipMode::SkipAllGpu);
 
     // Reschedule recurrent event
     impl->timing.ScheduleEvent(FRAME_TICKS - cycles_late, impl->vblank_event);

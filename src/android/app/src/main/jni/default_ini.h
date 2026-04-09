@@ -163,11 +163,17 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 
 # How aggressively to skip work on skipped frames. Only has an effect when
 # frame_skip > 0.
-# 0 (default): Present Only (safe)  - skip only the host present step.
-# 1: Skip Draws (aggressive)        - also no-op PICA DrawArrays/DrawImmediate
-#                                     on skipped frames. Saves significantly
-#                                     more CPU/GPU but may glitch games that
-#                                     read back the framebuffer mid-frame.
+# 0 (default): Present Only (safe)   - skip only the host present step.
+# 1: Skip Draws (aggressive)         - also no-op PICA DrawArrays/DrawImmediate
+#                                      on skipped frames. Saves significantly
+#                                      more CPU/GPU but may glitch games that
+#                                      read back the framebuffer mid-frame.
+# 2: Skip All GPU Work (most)        - also elides GPU MemoryFill and
+#                                      DisplayTransfer (non-texture-copy) on
+#                                      skipped frames. Saves the most GPU
+#                                      bandwidth but more likely to corrupt
+#                                      games using intermediate render-target
+#                                      copies.
 )") DECLARE_KEY(frame_skip_mode) BOOST_HANA_STRING(R"(
 
 # The clear color for the renderer. What shows up on the sides of the bottom screen.

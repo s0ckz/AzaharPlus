@@ -44,6 +44,12 @@ struct GPU::Impl {
     // just-finished frame was marked as "skipped", so we will not call
     // SwapBuffers for it when this vblank fires.
     bool skip_current_present{false};
+    // Set by VBlankCallback when frame_skip_mode == SkipAllGpu and the
+    // upcoming frame is a skipped one. Causes GPU::MemoryFill and
+    // GPU::MemoryTransfer (non-texture-copy path) to short-circuit their
+    // actual work while still firing completion interrupts so the game
+    // advances normally.
+    bool skip_gpu_transfers{false};
 
     explicit Impl(Core::System& system, Frontend::EmuWindow& emu_window,
                   Frontend::EmuWindow* secondary_window)

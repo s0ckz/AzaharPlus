@@ -129,7 +129,8 @@ enum class AspectRatio : u32 {
 
 // Selects how aggressively the emulator skips work on skipped frames when
 // frame_skip > 0. Emulated timing (CPU, audio, GSP interrupts) is NEVER altered
-// by any of these modes — only host-side work is elided.
+// by any of these modes — only host-side work is elided. Each mode is a strict
+// superset of the previous one.
 enum class FrameSkipMode : u32 {
     // Only skips the host present/composition step. The PICA rasterizer still
     // translates every draw into host GL/Vulkan commands as normal; this saves
@@ -142,6 +143,14 @@ enum class FrameSkipMode : u32 {
     // but may cause visual glitches in games that read back framebuffer
     // contents mid-frame (reflections, capture effects).
     SkipDraws = 1,
+    // Most aggressive mode. In addition to skipping draws, also elides GPU
+    // MemoryFill (framebuffer clears) and non-texture-copy DisplayTransfer
+    // (render target → screen framebuffer copies) on skipped frames. GSP
+    // completion interrupts (PSC0/PSC1/PPF) are still fired so the game's
+    // GPU command processor advances normally. Saves bandwidth and GPU time
+    // on weaker SoCs but can visibly corrupt games that depend on
+    // intermediate framebuffer copies between render targets.
+    SkipAllGpu = 2,
 };
 
 namespace NativeButton {

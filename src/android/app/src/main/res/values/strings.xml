@@ -305,6 +305,7 @@
     <string name="frame_skip_mode_description">Controls how aggressively the emulator elides work on skipped frames. Only takes effect when Frame Skip is greater than 0.</string>
     <string name="frame_skip_mode_present_only">Present Only (Safe)</string>
     <string name="frame_skip_mode_skip_draws">Skip Draws (Aggressive)</string>
+    <string name="frame_skip_mode_skip_all_gpu">Skip All GPU Work (Most Aggressive)</string>
     <string name="frame_skip_mode_disabled_hint">Enable Frame Skip first to choose a mode.</string>
     <string name="expand_to_cutout_area">Expand to Cutout Area</string>
     <string name="expand_to_cutout_area_description">Expands the display area to include the cutout (or notch) area.</string>
