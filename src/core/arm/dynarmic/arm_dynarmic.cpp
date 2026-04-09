@@ -340,9 +340,9 @@ std::unique_ptr<Dynarmic::A32::Jit> ARM_Dynarmic::MakeJit() {
         config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP;
         config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
         config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue;
-        LOG_INFO(Core_ARM, "Dynarmic: CpuAccuracy=Fast (unsafe FP optimizations enabled)");
+        LOG_INFO(Core_ARM11, "Dynarmic: CpuAccuracy=Fast (unsafe FP optimizations enabled)");
     } else {
-        LOG_INFO(Core_ARM, "Dynarmic: CpuAccuracy=Accurate (safe optimizations only)");
+        LOG_INFO(Core_ARM11, "Dynarmic: CpuAccuracy=Accurate (safe optimizations only)");
     }
 
     return std::make_unique<Dynarmic::A32::Jit>(config);
