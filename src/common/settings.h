@@ -567,7 +567,20 @@ struct Values {
     Setting<bool> dump_command_buffers{false, Keys::dump_command_buffers};
     SwitchableSetting<bool> spirv_shader_gen{true, Keys::spirv_shader_gen};
     SwitchableSetting<bool> disable_spirv_optimizer{true, Keys::disable_spirv_optimizer};
+    // Compile PICA shader variants on a worker thread instead of blocking the
+    // emulation thread while the host GPU driver translates SPIR-V to native.
+    // On Mali-Bifrost (RK3568 handhelds etc.) the first-encounter compile of
+    // a shader can take tens to hundreds of milliseconds, which shows up as a
+    // frame hitch every time the game hits a new effect (item trails, drift
+    // sparks, boost flames in MK7 for example). Defaulting this on for
+    // Android is the single biggest stutter-reduction knob on weak mobile
+    // SoCs. Desktop keeps it off because per-shader compile is so fast there
+    // that the async dispatch overhead is net-negative.
+#ifdef ANDROID
+    SwitchableSetting<bool> async_shader_compilation{true, Keys::async_shader_compilation};
+#else
     SwitchableSetting<bool> async_shader_compilation{false, Keys::async_shader_compilation};
+#endif
     SwitchableSetting<bool> async_presentation{true, Keys::async_presentation};
     SwitchableSetting<bool> use_hw_shader{true, Keys::use_hw_shader};
     SwitchableSetting<bool> use_disk_shader_cache{true, Keys::use_disk_shader_cache};
