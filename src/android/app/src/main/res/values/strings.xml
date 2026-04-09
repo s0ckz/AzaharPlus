@@ -301,6 +301,11 @@
     <string name="turbo_limit_description">Emulation speed limit used while the turbo hotkey is active.</string>
     <string name="frame_skip">Frame Skip</string>
     <string name="frame_skip_description">Skips presenting every Nth emulated frame to the display to save CPU/GPU work on weaker devices. Emulated timing, physics and audio are unaffected. 0 = present every frame, 1 = present every other frame (~30 FPS), 2 = present one of every three frames, etc.</string>
+    <string name="frame_skip_mode">Frame Skip Mode</string>
+    <string name="frame_skip_mode_description">Controls how aggressively the emulator elides work on skipped frames. Only takes effect when Frame Skip is greater than 0.</string>
+    <string name="frame_skip_mode_present_only">Present Only (Safe)</string>
+    <string name="frame_skip_mode_skip_draws">Skip Draws (Aggressive)</string>
+    <string name="frame_skip_mode_disabled_hint">Enable Frame Skip first to choose a mode.</string>
     <string name="expand_to_cutout_area">Expand to Cutout Area</string>
     <string name="expand_to_cutout_area_description">Expands the display area to include the cutout (or notch) area.</string>
     <string name="internal_resolution">Internal Resolution</string>

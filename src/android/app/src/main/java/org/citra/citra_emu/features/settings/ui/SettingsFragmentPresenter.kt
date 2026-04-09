@@ -269,6 +269,25 @@ class SettingsFragmentPresenter(private val fragmentView: SettingsFragmentView) 
                     IntSetting.FRAME_SKIP.defaultValue.toFloat()
                 )
             )
+            // Frame skip mode is only meaningful when frame skip is active,
+            // so disable it entirely when the slider is at 0. The presenter
+            // list is rebuilt whenever a slider commits a new value, so this
+            // condition re-evaluates live as the user drags FRAME_SKIP.
+            add(
+                SingleChoiceSetting(
+                    IntSetting.FRAME_SKIP_MODE,
+                    R.string.frame_skip_mode,
+                    if (IntSetting.FRAME_SKIP.int > 0)
+                        R.string.frame_skip_mode_description
+                    else
+                        R.string.frame_skip_mode_disabled_hint,
+                    R.array.frameSkipModes,
+                    R.array.frameSkipModeValues,
+                    IntSetting.FRAME_SKIP_MODE.key,
+                    IntSetting.FRAME_SKIP_MODE.defaultValue,
+                    isEnabled = IntSetting.FRAME_SKIP.int > 0
+                )
+            )
             add(
                 SwitchSetting(
                     BooleanSetting.ANDROID_HIDE_IMAGES,

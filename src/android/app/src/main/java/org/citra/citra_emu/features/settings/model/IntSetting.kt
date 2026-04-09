@@ -55,6 +55,7 @@ enum class IntSetting(
     ORIENTATION_OPTION(SettingKeys.screen_orientation(), Settings.SECTION_LAYOUT, 2),
     TURBO_LIMIT(SettingKeys.turbo_limit(), Settings.SECTION_CORE, 200),
     FRAME_SKIP(SettingKeys.frame_skip(), Settings.SECTION_RENDERER, 0),
+    FRAME_SKIP_MODE(SettingKeys.frame_skip_mode(), Settings.SECTION_RENDERER, 0),
     PERFORMANCE_OVERLAY_POSITION(SettingKeys.performance_overlay_position(), Settings.SECTION_LAYOUT, 0),
     RENDER_3D_WHICH_DISPLAY(SettingKeys.render_3d_which_display(),Settings.SECTION_RENDERER,0),
     ASPECT_RATIO(SettingKeys.aspect_ratio(), Settings.SECTION_LAYOUT, 0);

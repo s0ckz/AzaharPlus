@@ -100,6 +100,7 @@ void LogSettings() {
     log_setting("Renderer_UseIntegerScaling", values.use_integer_scaling.GetValue());
     log_setting("Renderer_FrameLimit", values.frame_limit.GetValue());
     log_setting("Renderer_FrameSkip", values.frame_skip.GetValue());
+    log_setting("Renderer_FrameSkipMode", static_cast<u32>(values.frame_skip_mode.GetValue()));
     log_setting("Renderer_VSyncNew", values.use_vsync.GetValue());
     log_setting("Renderer_PostProcessingShader", values.pp_shader_name.GetValue());
     log_setting("Renderer_FilterMode", values.filter_mode.GetValue());
@@ -214,6 +215,7 @@ void RestoreGlobalState(bool is_powered_on) {
     values.use_integer_scaling.SetGlobal(true);
     values.frame_limit.SetGlobal(true);
     values.frame_skip.SetGlobal(true);
+    values.frame_skip_mode.SetGlobal(true);
     values.texture_filter.SetGlobal(true);
     values.texture_sampling.SetGlobal(true);
     values.delay_game_render_thread_us.SetGlobal(true);

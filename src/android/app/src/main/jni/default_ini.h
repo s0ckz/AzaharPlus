@@ -154,11 +154,21 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 
 # Skips presenting every Nth emulated frame to save host CPU/GPU work without
 # altering emulated timing. The emulated 3DS still runs at ~60Hz so game logic,
-# physics and audio are unaffected; only the display composition/present step is
-# skipped for host performance on weaker devices.
+# physics and audio are unaffected; only the display composition/present step
+# (and, in aggressive mode, the PICA draw calls) is skipped for host
+# performance on weaker devices.
 # 0 (default): Present every frame, 1: Present 1 of every 2 frames (~30fps),
 # 2: Present 1 of every 3 frames (~20fps), ...
 )") DECLARE_KEY(frame_skip) BOOST_HANA_STRING(R"(
+
+# How aggressively to skip work on skipped frames. Only has an effect when
+# frame_skip > 0.
+# 0 (default): Present Only (safe)  - skip only the host present step.
+# 1: Skip Draws (aggressive)        - also no-op PICA DrawArrays/DrawImmediate
+#                                     on skipped frames. Saves significantly
+#                                     more CPU/GPU but may glitch games that
+#                                     read back the framebuffer mid-frame.
+)") DECLARE_KEY(frame_skip_mode) BOOST_HANA_STRING(R"(
 
 # The clear color for the renderer. What shows up on the sides of the bottom screen.
 # Must be in range of 0.0-1.0. Defaults to 0.0 for all.

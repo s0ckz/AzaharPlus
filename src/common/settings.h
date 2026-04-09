@@ -127,6 +127,23 @@ enum class AspectRatio : u32 {
     Stretch = 5,
 };
 
+// Selects how aggressively the emulator skips work on skipped frames when
+// frame_skip > 0. Emulated timing (CPU, audio, GSP interrupts) is NEVER altered
+// by any of these modes — only host-side work is elided.
+enum class FrameSkipMode : u32 {
+    // Only skips the host present/composition step. The PICA rasterizer still
+    // translates every draw into host GL/Vulkan commands as normal; this saves
+    // mainly display-transfer and present-path cost. Never causes visual
+    // glitches. Safest.
+    PresentOnly = 0,
+    // In addition to skipping present, short-circuits PICA DrawArrays /
+    // DrawImmediate on skipped frames so vertex shaders / draw submission are
+    // no-op'd on the host. Saves significantly more CPU/GPU on weaker devices
+    // but may cause visual glitches in games that read back framebuffer
+    // contents mid-frame (reflections, capture effects).
+    SkipDraws = 1,
+};
+
 namespace NativeButton {
 
 enum Values {
@@ -536,8 +553,12 @@ struct Values {
     // Skips presenting every Nth emulated frame to save host CPU/GPU work without
     // altering emulated timing (VBlank interrupts still fire at 60Hz so game logic,
     // physics and audio are untouched). 0 = present every frame, 1 = skip every other
-    // frame (~30fps presented), 2 = present 1 of 3, etc.
+    // frame (~30fps presented), 2 = present 1 of 3, etc. When 0, frame_skip_mode
+    // has no effect.
     SwitchableSetting<u32, true> frame_skip{0, 0, 9, Keys::frame_skip};
+    // How aggressively to skip on skipped frames. Only effective when frame_skip > 0.
+    SwitchableSetting<FrameSkipMode> frame_skip_mode{FrameSkipMode::PresentOnly,
+                                                     Keys::frame_skip_mode};
     SwitchableSetting<TextureFilter> texture_filter{TextureFilter::NoFilter, Keys::texture_filter};
     SwitchableSetting<TextureSampling> texture_sampling{TextureSampling::GameControlled,
                                                         Keys::texture_sampling};

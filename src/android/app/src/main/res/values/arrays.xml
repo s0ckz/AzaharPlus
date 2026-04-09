@@ -238,6 +238,16 @@
         <item>4</item>
     </integer-array>
 
+    <string-array name="frameSkipModes">
+        <item>@string/frame_skip_mode_present_only</item>
+        <item>@string/frame_skip_mode_skip_draws</item>
+    </string-array>
+
+    <integer-array name="frameSkipModeValues">
+        <item>0</item>
+        <item>1</item>
+    </integer-array>
+
     <string-array name="render3dModes">
         <item>@string/side_by_side</item>
         <item>@string/side_by_side_full</item>

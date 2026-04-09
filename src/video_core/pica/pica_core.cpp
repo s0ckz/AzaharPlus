@@ -484,6 +484,13 @@ void PicaCore::SubmitImmediate(u32 value) {
 }
 
 void PicaCore::DrawImmediate() {
+    if (skip_draws) {
+        // Aggressive frame-skip: discard the pending immediate-mode vertex without
+        // running the vertex shader or submitting anything to the rasterizer.
+        immediate.current_attribute = 0;
+        return;
+    }
+
     // Compile the vertex shader.
     shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
 
@@ -527,6 +534,17 @@ void PicaCore::DrawArrays(bool is_indexed) {
     // Track vertex in the debug recorder.
     if (debug_context) {
         debug_context->OnEvent(DebugContext::Event::IncomingPrimitiveBatch, nullptr);
+    }
+
+    if (skip_draws) {
+        // Aggressive frame-skip: do not translate this draw into host GL/Vulkan
+        // commands. The game's register state is still being updated by
+        // WriteInternalReg around us, so the following non-skipped frame will
+        // resume with the correct pipeline / shader / texture bindings.
+        if (debug_context) {
+            debug_context->OnEvent(DebugContext::Event::FinishedPrimitiveBatch, nullptr);
+        }
+        return;
     }
 
     const bool accelerate_draw = [this] {

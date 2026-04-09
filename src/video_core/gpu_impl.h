@@ -36,9 +36,14 @@ struct GPU::Impl {
     Core::TimingEventType* vblank_event;
     Service::GSP::InterruptHandler signal_interrupt;
     // Counter used by the frame-skip feature. Increments on every vblank and is
-    // compared against Settings::values.frame_skip to decide whether to present
-    // the current emulated frame to the host display.
+    // compared against Settings::values.frame_skip to decide whether the next
+    // emulated frame should be rendered / presented.
     u64 vblank_counter{0};
+    // Decision made at the *previous* vblank for the frame that was rendered
+    // during the interval leading up to the current vblank. True means the
+    // just-finished frame was marked as "skipped", so we will not call
+    // SwapBuffers for it when this vblank fires.
+    bool skip_current_present{false};
 
     explicit Impl(Core::System& system, Frontend::EmuWindow& emu_window,
                   Frontend::EmuWindow* secondary_window)

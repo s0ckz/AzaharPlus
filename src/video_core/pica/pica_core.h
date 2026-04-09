@@ -40,6 +40,17 @@ public:
 
     void ProcessCmdList(PAddr list, u32 size, bool ignore_list);
 
+    /// When true, DrawArrays/DrawImmediate are no-op'd so PICA vertex shaders
+    /// and rasterizer draw submission don't run on the host for the current
+    /// frame. Used by the aggressive frame-skip mode.
+    void SetSkipDraws(bool skip) {
+        skip_draws = skip;
+    }
+
+    bool IsSkippingDraws() const {
+        return skip_draws;
+    }
+
 private:
     void InitializeRegs();
 
@@ -317,6 +328,7 @@ private:
     GeometryPipeline geometry_pipeline;
     PrimitiveAssembler primitive_assembler;
     CommandList cmd_list;
+    bool skip_draws{false};
     std::unique_ptr<ShaderEngine> shader_engine;
 };
 

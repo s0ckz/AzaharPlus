@@ -412,28 +412,45 @@ void GPU::MemoryTransfer() {
 }
 
 void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
-    // Frame-skip: only actually present every (frame_skip + 1)-th vblank. The
-    // emulated CPU, audio and GSP interrupts keep running at the native ~60Hz
-    // rate regardless, so game logic, physics and sound timing are unaffected —
-    // we only skip the expensive host-side composition/present work. On skipped
-    // frames we still call EndFrame() so that frame limiting, event polling and
-    // perf-stats bookkeeping continue to run every vblank.
-    const u32 frame_skip = Settings::values.frame_skip.GetValue();
-    const bool present_frame = (frame_skip == 0) || (impl->vblank_counter % (frame_skip + 1) == 0);
-    impl->vblank_counter++;
+    // Frame-skip: emulated timing is always 60Hz (this callback fires every
+    // FRAME_TICKS ARM11 cycles regardless) so game logic, audio and physics
+    // are untouched. What we manipulate is:
+    //
+    //   (a) whether the frame that JUST completed is presented to the host,
+    //   (b) whether the frame that is ABOUT TO START rendering will run its
+    //       PICA draw calls through the host GPU at all.
+    //
+    // Decision (a) was made at the previous vblank and is stored in
+    // `skip_current_present`. Decision (b) is made now for the upcoming frame
+    // and is communicated to the PicaCore via SetSkipDraws().
 
-    if (present_frame) {
-        // Present renderered frame.
+    // (a) Present (or skip-present) the frame that was rendered in the
+    // interval before this vblank.
+    if (!impl->skip_current_present) {
         impl->renderer->SwapBuffers();
     } else {
-        // Keep frame-limiter / input polling / perf counters ticking so emulated
-        // timing stays on the 60Hz cadence even when we don't draw this frame.
+        // Keep frame-limiter / input polling / perf counters ticking so the
+        // emulator's wall-clock pacing stays on the 60Hz cadence even when we
+        // don't draw this frame.
         impl->renderer->EndFrame();
     }
 
-    // Signal to GSP that GPU interrupt has occurred
+    // Signal to GSP that GPU interrupt has occurred. Always fired — the game
+    // relies on this heartbeat to advance its own logic.
     impl->signal_interrupt(Service::GSP::InterruptId::PDC0);
     impl->signal_interrupt(Service::GSP::InterruptId::PDC1);
+
+    // (b) Decide whether the next frame will be skipped and propagate to the
+    // PicaCore when the aggressive mode is selected.
+    impl->vblank_counter++;
+    const u32 frame_skip = Settings::values.frame_skip.GetValue();
+    const bool next_is_skip =
+        (frame_skip > 0) && ((impl->vblank_counter % (frame_skip + 1)) != 0);
+    impl->skip_current_present = next_is_skip;
+
+    const bool aggressive =
+        Settings::values.frame_skip_mode.GetValue() == Settings::FrameSkipMode::SkipDraws;
+    impl->pica.SetSkipDraws(next_is_skip && aggressive);
 
     // Reschedule recurrent event
     impl->timing.ScheduleEvent(FRAME_TICKS - cycles_late, impl->vblank_event);
