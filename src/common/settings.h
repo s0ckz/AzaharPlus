@@ -533,6 +533,11 @@ struct Values {
     SwitchableSetting<bool> use_integer_scaling{false, Keys::use_integer_scaling};
     SwitchableSetting<double, true> frame_limit{100, 0, 1000, Keys::frame_limit};
     SwitchableSetting<double, true> turbo_limit{200, 0, 1000, Keys::turbo_limit};
+    // Skips presenting every Nth emulated frame to save host CPU/GPU work without
+    // altering emulated timing (VBlank interrupts still fire at 60Hz so game logic,
+    // physics and audio are untouched). 0 = present every frame, 1 = skip every other
+    // frame (~30fps presented), 2 = present 1 of 3, etc.
+    SwitchableSetting<u32, true> frame_skip{0, 0, 9, Keys::frame_skip};
     SwitchableSetting<TextureFilter> texture_filter{TextureFilter::NoFilter, Keys::texture_filter};
     SwitchableSetting<TextureSampling> texture_sampling{TextureSampling::GameControlled,
                                                         Keys::texture_sampling};

@@ -45,6 +45,7 @@ foreach(KEY IN ITEMS
     "resolution_factor"
     "frame_limit"
     "turbo_limit"
+    "frame_skip"
     "texture_filter"
     "texture_sampling"
     "delay_game_render_thread_us"

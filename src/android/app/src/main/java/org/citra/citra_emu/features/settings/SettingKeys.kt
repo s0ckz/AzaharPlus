@@ -42,6 +42,7 @@ object SettingKeys {
     external fun resolution_factor(): String
     external fun frame_limit(): String
     external fun turbo_limit(): String
+    external fun frame_skip(): String
     external fun texture_filter(): String
     external fun texture_sampling(): String
     external fun delay_game_render_thread_us(): String

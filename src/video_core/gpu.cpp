@@ -5,6 +5,7 @@
 #include "common/archives.h"
 #include "common/hacks/hack_manager.h"
 #include "common/microprofile.h"
+#include "common/settings.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/service/gsp/gsp_gpu.h"
@@ -411,8 +412,24 @@ void GPU::MemoryTransfer() {
 }
 
 void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
-    // Present renderered frame.
-    impl->renderer->SwapBuffers();
+    // Frame-skip: only actually present every (frame_skip + 1)-th vblank. The
+    // emulated CPU, audio and GSP interrupts keep running at the native ~60Hz
+    // rate regardless, so game logic, physics and sound timing are unaffected —
+    // we only skip the expensive host-side composition/present work. On skipped
+    // frames we still call EndFrame() so that frame limiting, event polling and
+    // perf-stats bookkeeping continue to run every vblank.
+    const u32 frame_skip = Settings::values.frame_skip.GetValue();
+    const bool present_frame = (frame_skip == 0) || (impl->vblank_counter % (frame_skip + 1) == 0);
+    impl->vblank_counter++;
+
+    if (present_frame) {
+        // Present renderered frame.
+        impl->renderer->SwapBuffers();
+    } else {
+        // Keep frame-limiter / input polling / perf counters ticking so emulated
+        // timing stays on the 60Hz cadence even when we don't draw this frame.
+        impl->renderer->EndFrame();
+    }
 
     // Signal to GSP that GPU interrupt has occurred
     impl->signal_interrupt(Service::GSP::InterruptId::PDC0);

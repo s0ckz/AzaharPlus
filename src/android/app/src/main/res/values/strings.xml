@@ -299,6 +299,8 @@
     <string name="android_hide_images_description">Prevent 3DS camera, screenshot, and custom texture images from being indexed by Android and displayed in the gallery. Your device may need to be rebooted after changing this setting to take effect.</string>
     <string name="turbo_limit">Turbo Speed Limit</string>
     <string name="turbo_limit_description">Emulation speed limit used while the turbo hotkey is active.</string>
+    <string name="frame_skip">Frame Skip</string>
+    <string name="frame_skip_description">Skips presenting every Nth emulated frame to the display to save CPU/GPU work on weaker devices. Emulated timing, physics and audio are unaffected. 0 = present every frame, 1 = present every other frame (~30 FPS), 2 = present one of every three frames, etc.</string>
     <string name="expand_to_cutout_area">Expand to Cutout Area</string>
     <string name="expand_to_cutout_area_description">Expands the display area to include the cutout (or notch) area.</string>
     <string name="internal_resolution">Internal Resolution</string>

@@ -35,6 +35,10 @@ struct GPU::Impl {
     std::unique_ptr<SwRenderer::SwBlitter> sw_blitter;
     Core::TimingEventType* vblank_event;
     Service::GSP::InterruptHandler signal_interrupt;
+    // Counter used by the frame-skip feature. Increments on every vblank and is
+    // compared against Settings::values.frame_skip to decide whether to present
+    // the current emulated frame to the host display.
+    u64 vblank_counter{0};
 
     explicit Impl(Core::System& system, Frontend::EmuWindow& emu_window,
                   Frontend::EmuWindow* secondary_window)
