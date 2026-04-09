@@ -49,7 +49,7 @@ public:
         return &rasterizer;
     }
 
-    void SwapBuffers() override;
+    void SwapBuffers(bool skip_present = false) override;
     void TryPresent(int timeout_ms, bool is_secondary) override;
     void PrepareVideoDumping() override;
     void CleanupVideoDumping() override;

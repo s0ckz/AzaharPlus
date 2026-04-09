@@ -44,8 +44,11 @@ public:
     /// Returns the rasterizer owned by the renderer
     virtual VideoCore::RasterizerInterface* Rasterizer() = 0;
 
-    /// Finalize rendering the guest frame and draw into the presentation texture
-    virtual void SwapBuffers() = 0;
+    /// Finalize rendering the guest frame and draw into the presentation texture.
+    /// If @p skip_present is true the host presentation path is skipped (the
+    /// previous frame remains on screen); per-frame rasterizer bookkeeping
+    /// (EndFrame / TickFrame) still runs so caches stay consistent.
+    virtual void SwapBuffers(bool skip_present = false) = 0;
 
     /// Draws the latest frame to the window waiting timeout_ms for a frame to arrive (Renderer
     /// specific implementation)

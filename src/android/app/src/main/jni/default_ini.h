@@ -152,6 +152,12 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 # 1 - 9999: Speed limit as a percentage of target game speed. 100 (default)
 )") DECLARE_KEY(turbo_limit) BOOST_HANA_STRING(R"(
 
+# Skips rendering and presenting 1 out of every (frame_skip + 1) frames to free
+# CPU and GPU time for the rest of the emulator. Game logic and VBlank
+# interrupts still fire every frame.
+# 0 (default): Render every frame. 1 - 10: Skip that many frames per displayed frame.
+)") DECLARE_KEY(frame_skip) BOOST_HANA_STRING(R"(
+
 # The clear color for the renderer. What shows up on the sides of the bottom screen.
 # Must be in range of 0.0-1.0. Defaults to 0.0 for all.
 )") DECLARE_KEY(bg_red) BOOST_HANA_STRING(R"(

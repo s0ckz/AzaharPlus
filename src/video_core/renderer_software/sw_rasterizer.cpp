@@ -107,6 +107,12 @@ RasterizerSoftware::RasterizerSoftware(Memory::MemorySystem& memory_, Pica::Pica
 
 void RasterizerSoftware::AddTriangle(const Pica::OutputVertex& v0, const Pica::OutputVertex& v1,
                                      const Pica::OutputVertex& v2) {
+    if (skip_frame) {
+        // Discard the triangle on skipped frames. The software rasterizer
+        // draws eagerly per-triangle (DrawTriangles() is a no-op), so gating
+        // is done here.
+        return;
+    }
     /**
      * Clipping a planar n-gon against a plane will remove at least 1 vertex and introduces 2 at
      * the new edge (or less in degenerate cases). As such, we can say that each clipping plane

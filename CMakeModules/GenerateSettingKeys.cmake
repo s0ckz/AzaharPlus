@@ -44,6 +44,7 @@ foreach(KEY IN ITEMS
     "use_shader_jit"
     "resolution_factor"
     "frame_limit"
+    "frame_skip"
     "turbo_limit"
     "texture_filter"
     "texture_sampling"

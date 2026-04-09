@@ -710,6 +710,7 @@ void QtConfig::ReadRendererValues() {
     ReadGlobalSetting(Settings::values.resolution_factor);
     ReadGlobalSetting(Settings::values.use_integer_scaling);
     ReadGlobalSetting(Settings::values.frame_limit);
+    ReadGlobalSetting(Settings::values.frame_skip);
     ReadGlobalSetting(Settings::values.turbo_limit);
 
     ReadGlobalSetting(Settings::values.bg_red);
@@ -1254,6 +1255,7 @@ void QtConfig::SaveRendererValues() {
     WriteGlobalSetting(Settings::values.resolution_factor);
     WriteGlobalSetting(Settings::values.use_integer_scaling);
     WriteGlobalSetting(Settings::values.frame_limit);
+    WriteGlobalSetting(Settings::values.frame_skip);
     WriteGlobalSetting(Settings::values.turbo_limit);
 
     WriteGlobalSetting(Settings::values.bg_red);

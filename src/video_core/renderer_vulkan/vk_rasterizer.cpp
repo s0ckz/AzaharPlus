@@ -425,6 +425,11 @@ bool RasterizerVulkan::SetupGeometryShader() {
 }
 
 bool RasterizerVulkan::AccelerateDrawBatch(bool is_indexed) {
+    if (skip_frame) {
+        // Report the batch as handled so the PICA command processor does
+        // not fall back to the software draw path; discard its work.
+        return true;
+    }
     if (regs.pipeline.use_gs != Pica::PipelineRegs::UseGS::No) {
         if (regs.pipeline.gs_config.mode != Pica::PipelineRegs::GSMode::Point) {
             return false;
@@ -521,6 +526,13 @@ void RasterizerVulkan::SetupIndexArray() {
 
 void RasterizerVulkan::DrawTriangles() {
     if (vertex_batch.empty()) {
+        return;
+    }
+
+    if (skip_frame) {
+        // Clear the accumulated batch so it does not leak into the next
+        // non-skipped frame.
+        vertex_batch.clear();
         return;
     }
 

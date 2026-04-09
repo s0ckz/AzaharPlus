@@ -258,6 +258,18 @@ class SettingsFragmentPresenter(private val fragmentView: SettingsFragmentView) 
                 )
             )
             add(
+                SliderSetting(
+                    IntSetting.FRAME_SKIP,
+                    R.string.frame_skip,
+                    R.string.frame_skip_description,
+                    0,
+                    10,
+                    "",
+                    IntSetting.FRAME_SKIP.key,
+                    IntSetting.FRAME_SKIP.defaultValue.toFloat()
+                )
+            )
+            add(
                 SwitchSetting(
                     BooleanSetting.ANDROID_HIDE_IMAGES,
                     R.string.android_hide_images,

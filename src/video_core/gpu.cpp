@@ -5,6 +5,7 @@
 #include "common/archives.h"
 #include "common/hacks/hack_manager.h"
 #include "common/microprofile.h"
+#include "common/settings.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/service/gsp/gsp_gpu.h"
@@ -411,15 +412,29 @@ void GPU::MemoryTransfer() {
 }
 
 void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
-    // Present renderered frame.
-    impl->renderer->SwapBuffers();
+    // Present the frame that just finished. current_frame_skipped was
+    // chosen one VBlank ago and also governed whether rasterizer draws
+    // executed during this frame, so presentation must match.
+    impl->renderer->SwapBuffers(impl->current_frame_skipped);
 
-    // Signal to GSP that GPU interrupt has occurred
+    // Signal to GSP that GPU interrupt has occurred (must happen every
+    // frame regardless of skip state, or games will stall waiting for PDC
+    // interrupts).
     impl->signal_interrupt(Service::GSP::InterruptId::PDC0);
     impl->signal_interrupt(Service::GSP::InterruptId::PDC1);
 
-    // Reschedule recurrent event
+    // Reschedule recurrent event (must happen every frame).
     impl->timing.ScheduleEvent(FRAME_TICKS - cycles_late, impl->vblank_event);
+
+    // Decide skip state for the UPCOMING frame and arm the rasterizer
+    // before the game starts submitting its draw commands for it.
+    impl->frame_counter++;
+    const u32 skip = Settings::values.frame_skip.GetValue();
+    impl->current_frame_skipped =
+        (skip > 0) && ((impl->frame_counter % (static_cast<u64>(skip) + 1)) != 0);
+    if (impl->rasterizer) {
+        impl->rasterizer->SetSkipFrame(impl->current_frame_skipped);
+    }
 }
 
 void GPU::RecreateRenderer(Frontend::EmuWindow& emu_window, Frontend::EmuWindow* secondary_window) {

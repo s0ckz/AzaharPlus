@@ -36,6 +36,12 @@ struct GPU::Impl {
     Core::TimingEventType* vblank_event;
     Service::GSP::InterruptHandler signal_interrupt;
 
+    // Frame skip state. current_frame_skipped governs both whether the
+    // rasterizer skipped draws during the just-finished frame and whether
+    // SwapBuffers should skip host presentation for it.
+    u64 frame_counter{0};
+    bool current_frame_skipped{false};
+
     explicit Impl(Core::System& system, Frontend::EmuWindow& emu_window,
                   Frontend::EmuWindow* secondary_window)
         : timing{system.CoreTiming()}, system{system}, memory{system.Memory()},

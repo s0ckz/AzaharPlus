@@ -33,7 +33,7 @@ public:
         return screen_infos[static_cast<u32>(id)];
     }
 
-    void SwapBuffers() override;
+    void SwapBuffers(bool skip_present = false) override;
     void TryPresent(int timeout_ms, bool is_secondary) override {}
 
 private:

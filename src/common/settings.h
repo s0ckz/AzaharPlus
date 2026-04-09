@@ -532,6 +532,7 @@ struct Values {
     SwitchableSetting<u32, true> resolution_factor{1, 0, 10, Keys::resolution_factor};
     SwitchableSetting<bool> use_integer_scaling{false, Keys::use_integer_scaling};
     SwitchableSetting<double, true> frame_limit{100, 0, 1000, Keys::frame_limit};
+    SwitchableSetting<u32, true> frame_skip{0, 0, 10, Keys::frame_skip};
     SwitchableSetting<double, true> turbo_limit{200, 0, 1000, Keys::turbo_limit};
     SwitchableSetting<TextureFilter> texture_filter{TextureFilter::NoFilter, Keys::texture_filter};
     SwitchableSetting<TextureSampling> texture_sampling{TextureSampling::GameControlled,

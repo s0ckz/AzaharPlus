@@ -90,8 +90,20 @@ public:
         accurate_mul = accurate_mul_;
     }
 
+    /// Enable or disable draw skipping for the upcoming frame. When enabled,
+    /// DrawTriangles / AccelerateDrawBatch will early-return without drawing,
+    /// trading frame smoothness for CPU and GPU time.
+    void SetSkipFrame(bool skip_frame_) {
+        skip_frame = skip_frame_;
+    }
+
+    bool IsSkippingFrame() const {
+        return skip_frame;
+    }
+
 protected:
     bool accurate_mul = false;
+    bool skip_frame = false;
 
     // Rasterizer gets destroyed on reboot, so make the callback
     // static until a better solution is found.

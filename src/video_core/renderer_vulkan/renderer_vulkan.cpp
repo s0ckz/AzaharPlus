@@ -1109,36 +1109,43 @@ void RendererVulkan::DrawCursor(const Layout::FramebufferLayout& layout) {
     });
 }
 
-void RendererVulkan::SwapBuffers() {
-    system.perf_stats->StartSwap();
-    const Layout::FramebufferLayout& layout = render_window.GetFramebufferLayout();
-    PrepareRendertarget();
-    RenderScreenshot();
-    RenderToWindow(main_present_window, layout, false);
-#ifndef ANDROID
-    if (Settings::values.layout_option.GetValue() == Settings::LayoutOption::SeparateWindows) {
-        ASSERT(secondary_window);
-        const auto& secondary_layout = secondary_window->GetFramebufferLayout();
-        if (!secondary_present_window_ptr) {
-            secondary_present_window_ptr = std::make_unique<PresentWindow>(
-                *secondary_window, instance, scheduler, IsLowRefreshRate());
-        }
-        RenderToWindow(*secondary_present_window_ptr, secondary_layout, false);
-        secondary_window->PollEvents();
+void RendererVulkan::SwapBuffers(bool skip_present) {
+    // A pending screenshot always wants a freshly rendered frame.
+    if (settings.screenshot_requested.load()) {
+        skip_present = false;
     }
+
+    system.perf_stats->StartSwap();
+    if (!skip_present) {
+        const Layout::FramebufferLayout& layout = render_window.GetFramebufferLayout();
+        PrepareRendertarget();
+        RenderScreenshot();
+        RenderToWindow(main_present_window, layout, false);
+#ifndef ANDROID
+        if (Settings::values.layout_option.GetValue() == Settings::LayoutOption::SeparateWindows) {
+            ASSERT(secondary_window);
+            const auto& secondary_layout = secondary_window->GetFramebufferLayout();
+            if (!secondary_present_window_ptr) {
+                secondary_present_window_ptr = std::make_unique<PresentWindow>(
+                    *secondary_window, instance, scheduler, IsLowRefreshRate());
+            }
+            RenderToWindow(*secondary_present_window_ptr, secondary_layout, false);
+            secondary_window->PollEvents();
+        }
 #endif
 
 #ifdef ANDROID
-    if (secondary_window) {
-        const auto& secondary_layout = secondary_window->GetFramebufferLayout();
-        if (!secondary_present_window_ptr) {
-            secondary_present_window_ptr = std::make_unique<PresentWindow>(
-                *secondary_window, instance, scheduler, IsLowRefreshRate());
+        if (secondary_window) {
+            const auto& secondary_layout = secondary_window->GetFramebufferLayout();
+            if (!secondary_present_window_ptr) {
+                secondary_present_window_ptr = std::make_unique<PresentWindow>(
+                    *secondary_window, instance, scheduler, IsLowRefreshRate());
+            }
+            RenderToWindow(*secondary_present_window_ptr, secondary_layout, false);
+            secondary_window->PollEvents();
         }
-        RenderToWindow(*secondary_present_window_ptr, secondary_layout, false);
-        secondary_window->PollEvents();
-    }
 #endif
+    }
 
     system.perf_stats->EndSwap();
     rasterizer.TickFrame();

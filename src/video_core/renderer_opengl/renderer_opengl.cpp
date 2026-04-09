@@ -88,48 +88,55 @@ RendererOpenGL::RendererOpenGL(Core::System& system, Pica::PicaCore& pica_,
 
 RendererOpenGL::~RendererOpenGL() = default;
 
-void RendererOpenGL::SwapBuffers() {
+void RendererOpenGL::SwapBuffers(bool skip_present) {
+    // A pending screenshot always wants a freshly rendered frame.
+    if (settings.screenshot_requested.load()) {
+        skip_present = false;
+    }
+
     system.perf_stats->StartSwap();
     // Maintain the rasterizer's state as a priority
     OpenGLState prev_state = OpenGLState::GetCurState();
     state.Apply();
 
-    render_window.SetupFramebuffer();
+    if (!skip_present) {
+        render_window.SetupFramebuffer();
 
-    PrepareRendertarget();
-    RenderScreenshot();
+        PrepareRendertarget();
+        RenderScreenshot();
 #ifdef HAVE_LIBRETRO
-    DrawScreens(render_window.GetFramebufferLayout(), false);
-    render_window.SwapBuffers();
+        DrawScreens(render_window.GetFramebufferLayout(), false);
+        render_window.SwapBuffers();
 #else
-    const auto& main_layout = render_window.GetFramebufferLayout();
-    RenderToMailbox(main_layout, render_window.mailbox, false);
+        const auto& main_layout = render_window.GetFramebufferLayout();
+        RenderToMailbox(main_layout, render_window.mailbox, false);
 
 #ifdef ANDROID
-    // On Android, if secondary_window is defined at all,
-    // it means we have a second display
-    if (secondary_window) {
-        const auto& secondary_layout = secondary_window->GetFramebufferLayout();
-        RenderToMailbox(secondary_layout, secondary_window->mailbox, false);
-        secondary_window->PollEvents();
-    }
+        // On Android, if secondary_window is defined at all,
+        // it means we have a second display
+        if (secondary_window) {
+            const auto& secondary_layout = secondary_window->GetFramebufferLayout();
+            RenderToMailbox(secondary_layout, secondary_window->mailbox, false);
+            secondary_window->PollEvents();
+        }
 #else
-    if (Settings::values.layout_option.GetValue() == Settings::LayoutOption::SeparateWindows) {
-        ASSERT(secondary_window);
-        const auto& secondary_layout = secondary_window->GetFramebufferLayout();
-        RenderToMailbox(secondary_layout, secondary_window->mailbox, false);
-        secondary_window->PollEvents();
-    }
+        if (Settings::values.layout_option.GetValue() == Settings::LayoutOption::SeparateWindows) {
+            ASSERT(secondary_window);
+            const auto& secondary_layout = secondary_window->GetFramebufferLayout();
+            RenderToMailbox(secondary_layout, secondary_window->mailbox, false);
+            secondary_window->PollEvents();
+        }
 #endif
 
-    if (frame_dumper.IsDumping()) {
-        try {
-            RenderToMailbox(frame_dumper.GetLayout(), frame_dumper.mailbox, true);
-        } catch (const OGLTextureMailboxException& exception) {
-            LOG_DEBUG(Render_OpenGL, "Frame dumper exception caught: {}", exception.what());
+        if (frame_dumper.IsDumping()) {
+            try {
+                RenderToMailbox(frame_dumper.GetLayout(), frame_dumper.mailbox, true);
+            } catch (const OGLTextureMailboxException& exception) {
+                LOG_DEBUG(Render_OpenGL, "Frame dumper exception caught: {}", exception.what());
+            }
         }
-    }
 #endif
+    }
 
     system.perf_stats->EndSwap();
     EndFrame();

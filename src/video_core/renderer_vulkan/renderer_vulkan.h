@@ -80,7 +80,7 @@ public:
 
     void NotifySurfaceChanged(bool second) override;
 
-    void SwapBuffers() override;
+    void SwapBuffers(bool skip_present = false) override;
     void TryPresent(int timeout_ms, bool is_secondary) override {}
 
 private:

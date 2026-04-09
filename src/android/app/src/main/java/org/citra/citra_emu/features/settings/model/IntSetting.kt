@@ -12,6 +12,7 @@ enum class IntSetting(
     override val defaultValue: Int
 ) : AbstractIntSetting {
     FRAME_LIMIT(SettingKeys.frame_limit(), Settings.SECTION_RENDERER, 100),
+    FRAME_SKIP(SettingKeys.frame_skip(), Settings.SECTION_RENDERER, 0),
     EMULATED_REGION(SettingKeys.region_value(), Settings.SECTION_SYSTEM, -1),
     INIT_CLOCK(SettingKeys.init_clock(), Settings.SECTION_SYSTEM, 0),
     CAMERA_INNER_FLIP(SettingKeys.camera_inner_flip(), Settings.SECTION_CAMERA, 0),
