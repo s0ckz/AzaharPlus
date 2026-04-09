@@ -70,8 +70,10 @@ std::size_t TimeStretcher::Process(const s16* in, std::size_t num_in, s16* out,
         // member-owned scratch buffers rather than per-call std::vector
         // construction — on weak handheld SoCs (Cortex-A55) those heap calls
         // showed up as a real chunk of the audio thread's budget.
-        static_assert(sizeof(soundtouch::SAMPLETYPE) == sizeof(float),
-                      "TimeStretcher scratch buffers assume float SAMPLETYPE");
+        //
+        // Note: this whole branch is compiled out on Android, where Azahar's
+        // bundled SoundTouch is built with `short` SAMPLETYPE and the
+        // `else if` below is taken instead.
         if (float_scratch_in.size() < 2 * num_in) {
             float_scratch_in.resize(2 * num_in);
         }
