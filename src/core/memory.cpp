@@ -988,7 +988,8 @@ void MemorySystem::RasterizerMarkRegionCached(PAddr start, u32 size, bool cached
         for (VAddr vaddr : PhysicalToVirtualAddressForRasterizer(paddr)) {
             impl->cache_marker.Mark(vaddr, cached);
             for (auto& page_table : impl->page_table_list) {
-                PageType& page_type = page_table->attributes[vaddr >> CITRA_PAGE_BITS];
+                const auto idx = vaddr >> CITRA_PAGE_BITS;
+                PageType& page_type = page_table->attributes[idx];
 
                 if (cached) {
                     // Switch page type to cached if now cached
