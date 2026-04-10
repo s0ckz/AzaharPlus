@@ -9,8 +9,13 @@ fi
 
 cd src/android
 chmod +x ./gradlew
-./gradlew assembleRelease
-./gradlew bundleRelease
+# --stacktrace: last CI run failed at packageGooglePlayRelease inside
+# IncrementalSplitterRunnable with no diagnostic info, and Gradle's own output
+# literally said "Run with --stacktrace option to get the stack trace". Add it
+# unconditionally so any future failure gives us the actual exception instead of
+# a generic wrapper class name.
+./gradlew assembleRelease --stacktrace
+./gradlew bundleRelease --stacktrace
 
 ccache -s -v
 
