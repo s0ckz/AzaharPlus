@@ -70,6 +70,13 @@ public:
         return skip_draws.load(std::memory_order_relaxed);
     }
 
+    /// Diagnostic: returns the address of the skip_draws field itself, not
+    /// of the parent PicaCore. Used to detect any layout / ODR issue where
+    /// writer and reader could compute different offsets for the same field.
+    const void* DebugSkipDrawsAddr() const {
+        return static_cast<const void*>(&skip_draws);
+    }
+
 private:
     void InitializeRegs();
 

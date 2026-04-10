@@ -95,11 +95,17 @@ struct GpuExecCounters {
     // If they match, the bug is elsewhere (compiler, layout, aliasing).
     const void* writer_pica_addr = nullptr;
     const void* reader_pica_addr = nullptr;
-    // Snapshot of the writer's intended skip_draws value at the moment of the
-    // last SetSkipDraws call. Compare against what Execute reads to detect
-    // inter-call clobbering.
-    std::uint64_t last_writer_true_at_count = 0;
-    std::uint64_t last_writer_set_count = 0;
+    // ALSO log the address of the skip_draws field itself (not the parent
+    // PicaCore object) — if the parent address matches but the field address
+    // differs, there's an ODR / layout discrepancy that the parent-address
+    // probe can't catch.
+    const void* writer_skip_addr = nullptr;
+    const void* reader_skip_addr = nullptr;
+    // Read-back immediately after SetSkipDraws — if these don't agree with
+    // set_skip_true / set_skip_false, the setter itself is broken or the bool
+    // is being clobbered between successive instructions.
+    std::uint64_t readback_match = 0;
+    std::uint64_t readback_mismatch = 0;
 };
 GpuExecCounters g_gpu_exec;
 
@@ -209,6 +215,7 @@ void GPU::Execute(const Service::GSP::Command& command) {
         // report savings separately. SubmitCmdList() below makes the actual decision.
         const bool bypassing = impl->pica.IsSkippingDraws();
         g_gpu_exec.reader_pica_addr = static_cast<const void*>(&impl->pica);
+        g_gpu_exec.reader_skip_addr = impl->pica.DebugSkipDrawsAddr();
 
         // Trigger processing of the command list
         SubmitCmdList(0);
@@ -629,7 +636,16 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     const bool skip_draws = next_is_skip && (mode == Settings::FrameSkipMode::SkipDraws ||
                                               mode == Settings::FrameSkipMode::SkipAllGpu);
     impl->pica.SetSkipDraws(skip_draws);
+    // Immediate read-back: if this disagrees with the value we just set, the
+    // bool is being clobbered between successive instructions on the SAME thread.
+    const bool readback = impl->pica.IsSkippingDraws();
+    if (readback == skip_draws) {
+        ++g_gpu_exec.readback_match;
+    } else {
+        ++g_gpu_exec.readback_mismatch;
+    }
     g_gpu_exec.writer_pica_addr = static_cast<const void*>(&impl->pica);
+    g_gpu_exec.writer_skip_addr = impl->pica.DebugSkipDrawsAddr();
     if (skip_draws) {
         ++g_gpu_exec.set_skip_true;
     } else {
@@ -698,15 +714,21 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
         LOG_INFO(HW_GPU,
                  "GpuExecProbe cmdlist[n={} ms={:.2f}] cmdlist_bypass[n={} ms={:.2f}] "
                  "dma[n={} ms={:.2f}] other[n={} ms={:.2f}] set_skip[t={} f={}] "
-                 "addrs[w={} r={} match={}]",
+                 "readback[match={} mismatch={}] "
+                 "pica_addrs[w={} r={} match={}] "
+                 "skip_addrs[w={} r={} match={}]",
                  g_gpu_exec.cmdlist_n, g_gpu_exec.cmdlist_ns / 1.0e6,
                  g_gpu_exec.cmdlist_bypass_n, g_gpu_exec.cmdlist_bypass_ns / 1.0e6,
                  g_gpu_exec.dma_n, g_gpu_exec.dma_ns / 1.0e6,
                  g_gpu_exec.other_n, g_gpu_exec.other_ns / 1.0e6,
                  g_gpu_exec.set_skip_true, g_gpu_exec.set_skip_false,
+                 g_gpu_exec.readback_match, g_gpu_exec.readback_mismatch,
                  fmt::ptr(g_gpu_exec.writer_pica_addr),
                  fmt::ptr(g_gpu_exec.reader_pica_addr),
-                 g_gpu_exec.writer_pica_addr == g_gpu_exec.reader_pica_addr);
+                 g_gpu_exec.writer_pica_addr == g_gpu_exec.reader_pica_addr,
+                 fmt::ptr(g_gpu_exec.writer_skip_addr),
+                 fmt::ptr(g_gpu_exec.reader_skip_addr),
+                 g_gpu_exec.writer_skip_addr == g_gpu_exec.reader_skip_addr);
         g_gpu_exec = GpuExecCounters{};
 
         skip_log_last_ms = now_ms;
