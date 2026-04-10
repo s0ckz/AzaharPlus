@@ -1,8 +1,10 @@
 name: citra-libretro
 
 on:
+  # Skip the feature branch used for the 30fps optimization sprint — libretro
+  # builds aren't relevant to that work and eat CI minutes.
   push:
-    branches: [ "*" ]
+    branches-ignore: [ "claude/**" ]
     tags: [ "*" ]
   pull_request:
     branches: [ master ]

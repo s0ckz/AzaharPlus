@@ -1,8 +1,12 @@
 name: citra-format
 
 on:
+  # Skip the feature branch used for the 30fps optimization sprint — we only
+  # care about the android build there and want each iteration to be as short
+  # as possible. GitHub Actions rejects a mix of `branches` and
+  # `branches-ignore`, so this is branches-ignore-only.
   push:
-    branches: [ "*" ]
+    branches-ignore: [ "claude/**" ]
   pull_request:
     branches: [ master ]
 

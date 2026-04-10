@@ -9,7 +9,9 @@ on:
 
 jobs:
   source:
-    if: ${{ !github.head_ref }}
+    # Skip for the 30fps optimization feature branch — only the android job
+    # matters there and we want each CI iteration as short as possible.
+    if: ${{ !github.head_ref && !startsWith(github.ref, 'refs/heads/claude/') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,6 +26,8 @@ jobs:
           path: artifacts/
 
   linux:
+    # Skip for the 30fps optimization feature branch — see source: job above.
+    if: ${{ !startsWith(github.ref, 'refs/heads/claude/') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -68,6 +72,7 @@ jobs:
           path: artifacts/
 
   macos:
+    if: ${{ !startsWith(github.ref, 'refs/heads/claude/') }}
     runs-on: ${{ (matrix.target == 'x86_64' && 'macos-15-intel') || 'macos-26' }}
     strategy:
       fail-fast: false
@@ -110,6 +115,7 @@ jobs:
           path: artifacts/
 
   macos-universal:
+    if: ${{ !startsWith(github.ref, 'refs/heads/claude/') }}
     runs-on: macos-26
     needs: macos
     env:
@@ -142,6 +148,7 @@ jobs:
           path: artifacts/
 
   windows:
+    if: ${{ !startsWith(github.ref, 'refs/heads/claude/') }}
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -272,6 +279,7 @@ jobs:
           path: src/android/app/artifacts/
 
   docker:
+    if: ${{ !startsWith(github.ref, 'refs/heads/claude/') }}
     runs-on: ubuntu-latest
     container:
       image: docker:dind
