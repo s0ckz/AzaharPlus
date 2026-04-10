@@ -345,6 +345,33 @@ std::unique_ptr<Dynarmic::A32::Jit> ARM_Dynarmic::MakeJit() {
         LOG_INFO(Core_ARM11, "Dynarmic: CpuAccuracy=Accurate (safe optimizations only)");
     }
 
+    // One-shot diagnostic of the knobs that actually matter for throughput on a weak host
+    // (Android Cortex-A55 class). PerfProbe on this branch shows ~12ms/frame of `rest` bucket
+    // which is dominated by JIT execution, so knowing the JIT config is non-negotiable.
+    //
+    // NOTE on fastmem: fastmem_pointer is std::nullopt here because Citra's MemorySystem does
+    // NOT allocate guest memory as a contiguous 4GB host-mirrored arena — BufferMem is a
+    // plain std::vector<u8>. Wiring fastmem up is not a one-line change; it requires backing
+    // FCRAM/VRAM/etc with a mmap'd arena at a fixed host base and keeping page mappings in
+    // sync with the guest MMU. The page_table fast path IS enabled (set above) so loads/stores
+    // hitting a mapped page avoid the MemoryRead/Write callbacks, but every access still pays
+    // a bounds check + indirection vs the raw host-pointer access that fastmem would give.
+    LOG_INFO(Core_ARM11,
+             "Dynarmic JIT config: page_table={} fastmem={} unsafe_opts={} "
+             "define_unpredictable_behaviour={}",
+             config.page_table != nullptr ? "on" : "OFF",
+             config.fastmem_pointer.has_value() ? "on" : "OFF (not wired - see arm_dynarmic.cpp)",
+             config.unsafe_optimizations ? "on" : "off",
+             config.define_unpredictable_behaviour ? "on" : "off");
+    LOG_INFO(Core_ARM11,
+             "Dynarmic optimization flags: ReducedErrorFP={} InaccurateNaN={} "
+             "IgnoreStandardFPCRValue={} UnfuseFMA={} IgnoreGlobalMonitor={}",
+             config.HasOptimization(Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP),
+             config.HasOptimization(Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN),
+             config.HasOptimization(Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue),
+             config.HasOptimization(Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA),
+             config.HasOptimization(Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor));
+
     return std::make_unique<Dynarmic::A32::Jit>(config);
 }
 

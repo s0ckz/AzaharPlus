@@ -88,6 +88,14 @@ void PerfStats::EndDSPProcessing() {
     accumulated_dsp_time += (Clock::now() - start_dsp_time);
 }
 
+void PerfStats::BeginCoreTimingProcessing() {
+    start_core_timing_time = Clock::now();
+}
+
+void PerfStats::EndCoreTimingProcessing() {
+    accumulated_core_timing_time += (Clock::now() - start_core_timing_time);
+}
+
 void PerfStats::BeginSystemFrame() {
     std::scoped_lock lock{object_mutex};
 
@@ -167,10 +175,21 @@ PerfStats::Results PerfStats::GetAndResetStats(microseconds current_system_time_
                                   ? (duration_cast<DoubleSecs>(accumulated_dsp_time).count() /
                                      static_cast<double>(system_frames))
                                   : 0;
+    // core_timing nests dsp_hle (DSP HLE runs from a core-timing callback), so report
+    // core_timing EXCLUSIVE of dsp_hle — mirrors how time_hle_svc is exclusive of ipc.
+    last_stats.time_core_timing =
+        system_frames ? (duration_cast<DoubleSecs>(accumulated_core_timing_time -
+                                                   accumulated_dsp_time)
+                             .count() /
+                         static_cast<double>(system_frames))
+                      : 0;
 
+    // time_remaining = frametime - (svc nesting) - swap - core_timing (which already
+    // contains dsp_hle). After this split the remainder is effectively dynarec JIT time.
     last_stats.time_remaining =
         system_frames ? (duration_cast<DoubleSecs>((accumulated_frametime - accumulated_svc_time) -
-                                                   accumulated_swap_time - accumulated_dsp_time)
+                                                   accumulated_swap_time -
+                                                   accumulated_core_timing_time)
                              .count() /
                          static_cast<double>(system_frames))
                       : 0;
@@ -188,6 +207,7 @@ PerfStats::Results PerfStats::GetAndResetStats(microseconds current_system_time_
     accumulated_gpu_time = Clock::duration::zero();
     accumulated_swap_time = Clock::duration::zero();
     accumulated_dsp_time = Clock::duration::zero();
+    accumulated_core_timing_time = Clock::duration::zero();
     game_frames = 0;
     artic_transmitted = 0;
     prev_artic_event.raw &= artic_events.raw;
