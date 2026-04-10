@@ -31,6 +31,48 @@ constexpr VAddr VADDR_GPU = 0x1EF00000;
 MICROPROFILE_DEFINE(GPU_DisplayTransfer, "GPU", "DisplayTransfer", MP_RGB(100, 100, 255));
 MICROPROFILE_DEFINE(GPU_CmdlistProcessing, "GPU", "Cmdlist Processing", MP_RGB(100, 255, 100));
 
+namespace {
+// Diagnostic counters for the GPU transfer paths (texture copies, display transfers,
+// memory fills). For each path we track how many went through the rasterizer-accelerated
+// fast path vs fell back to the software blitter, plus cumulative wall-time in each.
+// The software fallback is catastrophically more expensive than the accelerated path
+// because it forces a GPU->CPU readback of the source region, a memcpy, and an invalidate
+// of any cached surface overlapping the destination — the PerfProbe 'gpu' bucket in
+// SMB3DL is dominated by this work, so knowing the accelerated/software ratio is the
+// single most useful data point for deciding whether to chase the rasterizer cache.
+//
+// No locking: these are updated inside GPU::Execute which already runs on the GSP
+// service thread under the same implicit serialization that perf_stats relies on. The
+// log output happens from VBlankCallback on the same thread, so the reset is race-free.
+struct TexXferCounters {
+    // Accelerated-path counts and cumulative ns.
+    std::uint64_t accel_tc = 0;
+    std::uint64_t accel_tc_ns = 0;
+    std::uint64_t accel_dt = 0;
+    std::uint64_t accel_dt_ns = 0;
+    std::uint64_t accel_mf = 0;
+    std::uint64_t accel_mf_ns = 0;
+    // Software-fallback counts and cumulative ns (INCLUDES the time wasted in the
+    // failed accelerate attempt before bailing out — that's the whole point, the
+    // bail-out itself eats time via GetTexCopySurface / GetSurfaceSubRect lookups).
+    std::uint64_t sw_tc = 0;
+    std::uint64_t sw_tc_ns = 0;
+    std::uint64_t sw_dt = 0;
+    std::uint64_t sw_dt_ns = 0;
+    std::uint64_t sw_mf = 0;
+    std::uint64_t sw_mf_ns = 0;
+};
+TexXferCounters g_tex_xfer;
+
+// Small helper so the call-sites stay legible.
+inline std::uint64_t NsSince(std::chrono::steady_clock::time_point t0) {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count());
+}
+} // namespace
+
 GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
          Frontend::EmuWindow* secondary_window)
     : right_eye_disabler{std::make_unique<RightEyeDisabler>(*this)},
@@ -363,8 +405,14 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
     // completion interrupt below so the game's GPU command processor keeps
     // advancing normally.
     if (!impl->skip_gpu_transfers) {
-        if (!impl->rasterizer->AccelerateFill(config)) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (impl->rasterizer->AccelerateFill(config)) {
+            ++g_tex_xfer.accel_mf;
+            g_tex_xfer.accel_mf_ns += NsSince(t0);
+        } else {
             impl->sw_blitter->MemoryFill(config);
+            ++g_tex_xfer.sw_mf;
+            g_tex_xfer.sw_mf_ns += NsSince(t0);
         }
     }
 
@@ -407,14 +455,26 @@ void GPU::MemoryTransfer() {
     // skipped frames in SkipAllGpu mode since we are not going to present
     // that framebuffer anyway.
     if (config.is_texture_copy) {
-        if (!impl->rasterizer->AccelerateTextureCopy(config)) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (impl->rasterizer->AccelerateTextureCopy(config)) {
+            ++g_tex_xfer.accel_tc;
+            g_tex_xfer.accel_tc_ns += NsSince(t0);
+        } else {
             impl->sw_blitter->TextureCopy(config);
+            ++g_tex_xfer.sw_tc;
+            g_tex_xfer.sw_tc_ns += NsSince(t0);
         }
     } else if (!impl->skip_gpu_transfers) {
         if (right_eye_disabler->ShouldAllowDisplayTransfer(config.GetPhysicalInputAddress(),
                                                            config.input_height)) {
-            if (!impl->rasterizer->AccelerateDisplayTransfer(config)) {
+            const auto t0 = std::chrono::steady_clock::now();
+            if (impl->rasterizer->AccelerateDisplayTransfer(config)) {
+                ++g_tex_xfer.accel_dt;
+                g_tex_xfer.accel_dt_ns += NsSince(t0);
+            } else {
                 impl->sw_blitter->DisplayTransfer(config);
+                ++g_tex_xfer.sw_dt;
+                g_tex_xfer.sw_dt_ns += NsSince(t0);
             }
         }
     }
@@ -504,6 +564,25 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
                  " next_is_skip={} skip_draws={} skip_gpu_transfers={}",
                  frame_skip, mode_name, skip_log_total, skip_log_skipped, next_is_skip,
                  skip_draws, impl->skip_gpu_transfers);
+
+        // Dump texture-copy / display-transfer / memory-fill acceleration ratios
+        // at the same 1 Hz cadence and reset the counters. The "ms" columns are
+        // cumulative wall time over the last ~1 s, in the path's own bucket, so
+        // you can compare them directly against the PerfProbe 'gpu' bucket value
+        // (which is reported per-frame by PerfProbe, not per-second — divide by
+        // the measured vblanks-per-second to correlate).
+        LOG_INFO(HW_GPU,
+                 "TexXferProbe tc[acc={} sw={} | acc_ms={:.2f} sw_ms={:.2f}] "
+                 "dt[acc={} sw={} | acc_ms={:.2f} sw_ms={:.2f}] "
+                 "mf[acc={} sw={} | acc_ms={:.2f} sw_ms={:.2f}]",
+                 g_tex_xfer.accel_tc, g_tex_xfer.sw_tc,
+                 g_tex_xfer.accel_tc_ns / 1.0e6, g_tex_xfer.sw_tc_ns / 1.0e6,
+                 g_tex_xfer.accel_dt, g_tex_xfer.sw_dt,
+                 g_tex_xfer.accel_dt_ns / 1.0e6, g_tex_xfer.sw_dt_ns / 1.0e6,
+                 g_tex_xfer.accel_mf, g_tex_xfer.sw_mf,
+                 g_tex_xfer.accel_mf_ns / 1.0e6, g_tex_xfer.sw_mf_ns / 1.0e6);
+        g_tex_xfer = TexXferCounters{};
+
         skip_log_last_ms = now_ms;
         skip_log_total = 0;
         skip_log_skipped = 0;
