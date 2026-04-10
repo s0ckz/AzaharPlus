@@ -80,6 +80,14 @@ void PerfStats::EndSwap() {
     accumulated_swap_time += (Clock::now() - start_swap_time);
 }
 
+void PerfStats::BeginDSPProcessing() {
+    start_dsp_time = Clock::now();
+}
+
+void PerfStats::EndDSPProcessing() {
+    accumulated_dsp_time += (Clock::now() - start_dsp_time);
+}
+
 void PerfStats::BeginSystemFrame() {
     std::scoped_lock lock{object_mutex};
 
@@ -155,10 +163,14 @@ PerfStats::Results PerfStats::GetAndResetStats(microseconds current_system_time_
                                ? (duration_cast<DoubleSecs>(accumulated_swap_time).count() /
                                   static_cast<double>(system_frames))
                                : 0;
+    last_stats.time_dsp_hle = system_frames
+                                  ? (duration_cast<DoubleSecs>(accumulated_dsp_time).count() /
+                                     static_cast<double>(system_frames))
+                                  : 0;
 
     last_stats.time_remaining =
         system_frames ? (duration_cast<DoubleSecs>((accumulated_frametime - accumulated_svc_time) -
-                                                   accumulated_swap_time)
+                                                   accumulated_swap_time - accumulated_dsp_time)
                              .count() /
                          static_cast<double>(system_frames))
                       : 0;
@@ -175,6 +187,7 @@ PerfStats::Results PerfStats::GetAndResetStats(microseconds current_system_time_
     accumulated_ipc_time = Clock::duration::zero();
     accumulated_gpu_time = Clock::duration::zero();
     accumulated_swap_time = Clock::duration::zero();
+    accumulated_dsp_time = Clock::duration::zero();
     game_frames = 0;
     artic_transmitted = 0;
     prev_artic_event.raw &= artic_events.raw;

@@ -65,6 +65,10 @@ public:
         // Walltime in seconds of the vblank interval spent in Renderer::SwapBuffers (includes
         // waiting for host GPU to finish)
         double time_swap;
+        // Walltime in seconds of the vblank interval spent in the DSP HLE audio tick running on
+        // the emu thread. Subtracted out of time_remaining so the remainder reflects dynarec +
+        // uninstrumented work only.
+        double time_dsp_hle;
         // Walltime in seconds of the vblank interval spent in other operations
         double time_remaining;
         /// Ratio of walltime / emulated time elapsed
@@ -83,6 +87,8 @@ public:
     void EndGPUProcessing();
     void StartSwap();
     void EndSwap();
+    void BeginDSPProcessing();
+    void EndDSPProcessing();
     void BeginSystemFrame();
     void EndSystemFrame();
     void EndGameFrame();
@@ -170,6 +176,9 @@ private:
 
     Clock::time_point start_swap_time = reset_point;
     Clock::duration accumulated_swap_time = Clock::duration::zero();
+
+    Clock::time_point start_dsp_time = reset_point;
+    Clock::duration accumulated_dsp_time = Clock::duration::zero();
 
     /// Last recorded performance statistics.
     Results last_stats;

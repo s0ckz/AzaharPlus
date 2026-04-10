@@ -968,11 +968,11 @@ jdoubleArray Java_org_citra_citra_1emu_NativeLibrary_getPerfStats(JNIEnv* env,
             const double frame_ms = results.time_vblank_interval * 1000.0;
             LOG_INFO(Frontend,
                      "PerfProbe speed={:.1f}% sysFPS={:.1f} gameFPS={:.1f} frame={:.2f}ms "
-                     "[svc={:.2f} ipc={:.2f} gpu={:.2f} swap={:.2f} rest={:.2f}]",
+                     "[svc={:.2f} ipc={:.2f} gpu={:.2f} swap={:.2f} dsp={:.2f} rest={:.2f}]",
                      results.emulation_speed * 100.0, results.system_fps, results.game_fps,
                      frame_ms, results.time_hle_svc * 1000.0, results.time_hle_ipc * 1000.0,
                      results.time_gpu * 1000.0, results.time_swap * 1000.0,
-                     results.time_remaining * 1000.0);
+                     results.time_dsp_hle * 1000.0, results.time_remaining * 1000.0);
         }
     }
 

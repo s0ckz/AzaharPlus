@@ -459,16 +459,29 @@ bool DspHle::Impl::Tick() {
 }
 
 void DspHle::Impl::AudioTickCallback(s64 cycles_late) {
+    // Account the wall-clock cost of the DSP HLE tick against perf_stats so the PerfProbe
+    // "rest" bucket can be decomposed into dsp_hle vs dynarec/misc. This runs on the emu
+    // thread via core_timing, so without this instrumentation the cost is invisible and
+    // lumps in with dynarec time in `rest`.
+    auto& system = Core::System::GetInstance();
+    if (system.perf_stats) {
+        system.perf_stats->BeginDSPProcessing();
+    }
+
     if (Tick()) {
         // TODO(merry): Signal all the other interrupts as appropriate.
         interrupt_handler(InterruptType::Pipe, DspPipe::Audio);
+    }
+
+    if (system.perf_stats) {
+        system.perf_stats->EndDSPProcessing();
     }
 
     // Reschedule recurrent event
     const double time_scale =
         Settings::values.enable_realtime_audio
             ? std::max(0.01, // Arbitrary small value to prevent time_scale from approaching zero
-                       Core::System::GetInstance().GetStableFrameTimeScale())
+                       system.GetStableFrameTimeScale())
             : 1.0;
     s64 adjusted_ticks = static_cast<s64>(audio_frame_ticks / time_scale - cycles_late);
     core_timing.ScheduleEvent(adjusted_ticks, tick_event);
