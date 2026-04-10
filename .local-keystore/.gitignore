@@ -1,0 +1,7 @@
+# Never commit anything in this directory. The local release keystore lives
+# here so subsequent local builds sign with the same key (so Android doesn't
+# refuse upgrades with "signature mismatch") but the keystore and its
+# credentials are SECRETS — even though this is a debug-grade local key, the
+# habit of keeping signing material out of git is non-negotiable.
+*
+!.gitignore
