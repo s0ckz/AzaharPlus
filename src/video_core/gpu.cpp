@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <chrono>
+#include <thread>
 #include <fmt/format.h>
 #include "common/archives.h"
 #include "common/hacks/hack_manager.h"
@@ -106,6 +107,13 @@ struct GpuExecCounters {
     // is being clobbered between successive instructions.
     std::uint64_t readback_match = 0;
     std::uint64_t readback_mismatch = 0;
+    // Thread IDs of writer (VBlankCallback) and reader (Execute) call sites.
+    // Hashed via std::hash<std::thread::id>{}() so we can compare in the log.
+    // If these differ, GSP::TriggerCmdReqQueue runs on a separate thread from
+    // VBlankCallback and the bool needs proper memory ordering — relaxed
+    // atomic isn't enough if there's no synchronization edge between them.
+    std::size_t writer_tid_hash = 0;
+    std::size_t reader_tid_hash = 0;
 };
 GpuExecCounters g_gpu_exec;
 
@@ -216,6 +224,7 @@ void GPU::Execute(const Service::GSP::Command& command) {
         const bool bypassing = impl->pica.IsSkippingDraws();
         g_gpu_exec.reader_pica_addr = static_cast<const void*>(&impl->pica);
         g_gpu_exec.reader_skip_addr = impl->pica.DebugSkipDrawsAddr();
+        g_gpu_exec.reader_tid_hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
 
         // Trigger processing of the command list
         SubmitCmdList(0);
@@ -646,6 +655,7 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     }
     g_gpu_exec.writer_pica_addr = static_cast<const void*>(&impl->pica);
     g_gpu_exec.writer_skip_addr = impl->pica.DebugSkipDrawsAddr();
+    g_gpu_exec.writer_tid_hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
     if (skip_draws) {
         ++g_gpu_exec.set_skip_true;
     } else {
@@ -715,6 +725,7 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
                  "GpuExecProbe cmdlist[n={} ms={:.2f}] cmdlist_bypass[n={} ms={:.2f}] "
                  "dma[n={} ms={:.2f}] other[n={} ms={:.2f}] set_skip[t={} f={}] "
                  "readback[match={} mismatch={}] "
+                 "tids[w={:x} r={:x} match={}] "
                  "pica_addrs[w={} r={} match={}] "
                  "skip_addrs[w={} r={} match={}]",
                  g_gpu_exec.cmdlist_n, g_gpu_exec.cmdlist_ns / 1.0e6,
@@ -723,6 +734,8 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
                  g_gpu_exec.other_n, g_gpu_exec.other_ns / 1.0e6,
                  g_gpu_exec.set_skip_true, g_gpu_exec.set_skip_false,
                  g_gpu_exec.readback_match, g_gpu_exec.readback_mismatch,
+                 g_gpu_exec.writer_tid_hash, g_gpu_exec.reader_tid_hash,
+                 g_gpu_exec.writer_tid_hash == g_gpu_exec.reader_tid_hash,
                  fmt::ptr(g_gpu_exec.writer_pica_addr),
                  fmt::ptr(g_gpu_exec.reader_pica_addr),
                  g_gpu_exec.writer_pica_addr == g_gpu_exec.reader_pica_addr,
