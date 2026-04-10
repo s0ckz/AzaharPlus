@@ -20,7 +20,16 @@ plugins {
  * next 680 years.
  */
 val autoVersion = (((System.currentTimeMillis() / 1000) - 1451606400) / 10).toInt()
-val abiFilter = listOf("arm64-v8a", "x86_64")
+// ABI filter is overridable via the AZAHAR_ABI_FILTER env var so local docker
+// builds can skip x86_64 (which is only relevant for emulators / x86 ChromeOS)
+// and roughly halve C++ build time. Comma-separated list, e.g.:
+//   AZAHAR_ABI_FILTER=arm64-v8a            # local sideload to physical arm64 device
+//   AZAHAR_ABI_FILTER=arm64-v8a,x86_64     # both (CI default if env unset)
+// CI doesn't set the env var so its behaviour is unchanged.
+val abiFilter = (System.getenv("AZAHAR_ABI_FILTER") ?: "arm64-v8a,x86_64")
+    .split(",")
+    .map { it.trim() }
+    .filter { it.isNotEmpty() }
 
 val downloadedJniLibsPath = "${layout.buildDirectory.get().asFile.path}/downloadedJniLibs"
 
