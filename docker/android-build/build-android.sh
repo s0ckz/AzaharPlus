@@ -128,6 +128,7 @@ echo " image:    $IMAGE_TAG"
 echo " ccache:   $CCACHE_VOL"
 echo " gradle:   $GRADLE_VOL"
 echo " keystore: $KEYSTORE_STATUS"
+echo " abi:      ${AZAHAR_ABI_FILTER:-arm64-v8a}"
 if [ "$INTERACTIVE_SHELL" -eq 1 ]; then
     echo " action:   interactive shell"
 else
@@ -150,6 +151,13 @@ echo ">>> Ensuring named cache volumes exist..."
 docker volume create "$CCACHE_VOL" >/dev/null
 docker volume create "$GRADLE_VOL" >/dev/null
 
+# ABI filter — local builds default to arm64-v8a only (skip x86_64) because the
+# vast majority of local-build use cases are sideloading to a physical arm64
+# device. x86_64 is only useful for the Android emulator. Set
+# AZAHAR_ABI_FILTER=arm64-v8a,x86_64 (or any subset) to override; the
+# build.gradle.kts reads the env var.
+AZAHAR_ABI_FILTER="${AZAHAR_ABI_FILTER:-arm64-v8a}"
+
 # Common docker run flags. We use --rm so containers don't pile up; the caches
 # persist via the named volumes regardless.
 RUN_FLAGS=(
@@ -164,6 +172,7 @@ RUN_FLAGS=(
     -e CCACHE_COMPILERCHECK=content
     -e CCACHE_SLOPPINESS=time_macros,include_file_mtime,include_file_ctime
     -e NDK_CCACHE=/usr/bin/ccache
+    -e "AZAHAR_ABI_FILTER=$AZAHAR_ABI_FILTER"
     "${KEYSTORE_FLAGS[@]}"
 )
 
