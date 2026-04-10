@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <chrono>
+#include <fmt/format.h>
 #include "common/archives.h"
 #include "common/hacks/hack_manager.h"
 #include "common/microprofile.h"
@@ -88,6 +89,17 @@ struct GpuExecCounters {
     // against cmdlist_bypass_n to debug why the shallow path isn't firing.
     std::uint64_t set_skip_true = 0;
     std::uint64_t set_skip_false = 0;
+    // Identity check: addresses of impl->pica seen by VBlankCallback (writer)
+    // and by GPU::Execute (reader). If these differ, there are two PicaCore
+    // instances and SetSkipDraws/IsSkippingDraws are touching different memory.
+    // If they match, the bug is elsewhere (compiler, layout, aliasing).
+    const void* writer_pica_addr = nullptr;
+    const void* reader_pica_addr = nullptr;
+    // Snapshot of the writer's intended skip_draws value at the moment of the
+    // last SetSkipDraws call. Compare against what Execute reads to detect
+    // inter-call clobbering.
+    std::uint64_t last_writer_true_at_count = 0;
+    std::uint64_t last_writer_set_count = 0;
 };
 GpuExecCounters g_gpu_exec;
 
@@ -196,6 +208,7 @@ void GPU::Execute(const Service::GSP::Command& command) {
         // Track whether the cmdlist is going to be bypassed so the sub-probe can
         // report savings separately. SubmitCmdList() below makes the actual decision.
         const bool bypassing = impl->pica.IsSkippingDraws();
+        g_gpu_exec.reader_pica_addr = static_cast<const void*>(&impl->pica);
 
         // Trigger processing of the command list
         SubmitCmdList(0);
@@ -616,6 +629,7 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     const bool skip_draws = next_is_skip && (mode == Settings::FrameSkipMode::SkipDraws ||
                                               mode == Settings::FrameSkipMode::SkipAllGpu);
     impl->pica.SetSkipDraws(skip_draws);
+    g_gpu_exec.writer_pica_addr = static_cast<const void*>(&impl->pica);
     if (skip_draws) {
         ++g_gpu_exec.set_skip_true;
     } else {
@@ -683,12 +697,16 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
         // equal (PerfProbe gpu per-frame × vblanks_last_s).
         LOG_INFO(HW_GPU,
                  "GpuExecProbe cmdlist[n={} ms={:.2f}] cmdlist_bypass[n={} ms={:.2f}] "
-                 "dma[n={} ms={:.2f}] other[n={} ms={:.2f}] set_skip[t={} f={}]",
+                 "dma[n={} ms={:.2f}] other[n={} ms={:.2f}] set_skip[t={} f={}] "
+                 "addrs[w={} r={} match={}]",
                  g_gpu_exec.cmdlist_n, g_gpu_exec.cmdlist_ns / 1.0e6,
                  g_gpu_exec.cmdlist_bypass_n, g_gpu_exec.cmdlist_bypass_ns / 1.0e6,
                  g_gpu_exec.dma_n, g_gpu_exec.dma_ns / 1.0e6,
                  g_gpu_exec.other_n, g_gpu_exec.other_ns / 1.0e6,
-                 g_gpu_exec.set_skip_true, g_gpu_exec.set_skip_false);
+                 g_gpu_exec.set_skip_true, g_gpu_exec.set_skip_false,
+                 fmt::ptr(g_gpu_exec.writer_pica_addr),
+                 fmt::ptr(g_gpu_exec.reader_pica_addr),
+                 g_gpu_exec.writer_pica_addr == g_gpu_exec.reader_pica_addr);
         g_gpu_exec = GpuExecCounters{};
 
         skip_log_last_ms = now_ms;
