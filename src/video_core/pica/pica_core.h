@@ -40,6 +40,19 @@ public:
 
     void ProcessCmdList(PAddr list, u32 size, bool ignore_list);
 
+    /// Lightweight cmdlist parser for skipped frames. Walks the exact same
+    /// command stream as ProcessCmdList but updates ONLY:
+    ///   - regs.internal.reg_array[id] (raw register value — preserves state)
+    ///   - auto-incrementing offsets (vs/gs program, swizzle, LUT indices)
+    ///   - dirty_regs (so the next rendered frame knows what to re-upload)
+    ///   - irq_request (game timing depends on the P3D completion signal)
+    ///   - command_buffer.trigger (sub-cmdlist chaining)
+    /// Everything else is skipped: no DrawArrays, no shader code uploads, no
+    /// uniform float-reg writes, no LUT data writes, no immediate-mode vertex
+    /// submission, no primitive assembler reconfig, no debug callbacks.
+    /// This preserves register state across frames at a fraction of the cost.
+    void ProcessCmdListShallow(PAddr list, u32 size);
+
     /// When true, DrawArrays/DrawImmediate are no-op'd so PICA vertex shaders
     /// and rasterizer draw submission don't run on the host for the current
     /// frame. Used by the aggressive frame-skip mode.

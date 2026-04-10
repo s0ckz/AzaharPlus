@@ -134,6 +134,188 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) {
     }
 }
 
+// Forward declaration — definition lives below near WriteInternalReg.
+static bool any_byte_match(u32 a, u32 b);
+
+void PicaCore::ProcessCmdListShallow(PAddr list, u32 size) {
+    // Initialize command list tracking — same as the full parser.
+    const u8* head = memory.GetPhysicalPointer(list);
+    cmd_list.Reset(list, head, size);
+
+    // Expand-mask table (same as WriteInternalReg).
+    constexpr std::array<u32, 16> ExpandBitsToBytes = {
+        0x00000000, 0x000000ff, 0x0000ff00, 0x0000ffff, 0x00ff0000, 0x00ff00ff,
+        0x00ffff00, 0x00ffffff, 0xff000000, 0xff0000ff, 0xff00ff00, 0xff00ffff,
+        0xffff0000, 0xffff00ff, 0xffffff00, 0xffffffff,
+    };
+
+    bool stop_requested = false;
+    while (cmd_list.current_index < cmd_list.length) {
+        if (stop_requested) [[unlikely]] {
+            break;
+        }
+        // Align read pointer to 8 bytes.
+        if (cmd_list.current_index % 2 != 0) {
+            cmd_list.current_index++;
+        }
+
+        // Decode header + value — identical to the full parser.
+        const u32 value = cmd_list.head[cmd_list.current_index++];
+        const CommandHeader header{cmd_list.head[cmd_list.current_index++]};
+
+        // Lambda that writes one register shallowly: reg_array update + dirty bit
+        // + offset increments for auto-incrementing register families, but NO
+        // expensive side effects.
+        const auto write_shallow = [&](u32 id, u32 val) {
+            if (id >= RegsInternal::NUM_REGS) [[unlikely]] {
+                return;
+            }
+            const u32 write_mask = ExpandBitsToBytes[header.parameter_mask];
+            regs.internal.reg_array[id] =
+                (regs.internal.reg_array[id] & ~write_mask) | (val & write_mask);
+            dirty_regs.Set(id);
+
+            // Handle the register families that have auto-incrementing offsets.
+            // We increment the offset but skip the data-upload side effect (shader
+            // code, swizzle patterns, LUT data). The next full-parse rendered frame
+            // will re-upload from scratch via its own cmdlist's writes.
+            switch (id) {
+            // IRQ — game timing depends on this firing.
+            case PICA_REG_INDEX(irq_request):
+                if (any_byte_match(regs.internal.reg_array[id], regs.internal.irq_compare))
+                    [[likely]] {
+                    signal_interrupt(Service::GSP::InterruptId::P3D);
+                    if (regs.internal.irq_autostop) [[likely]] {
+                        stop_requested = true;
+                    }
+                }
+                break;
+
+            // Sub-cmdlist chaining — must update the parsed cmd_list.
+            case PICA_REG_INDEX(pipeline.command_buffer.trigger[0]):
+            case PICA_REG_INDEX(pipeline.command_buffer.trigger[1]): {
+                const u32 idx =
+                    static_cast<u32>(id - PICA_REG_INDEX(pipeline.command_buffer.trigger[0]));
+                const PAddr addr = regs.internal.pipeline.command_buffer.GetPhysicalAddress(idx);
+                const u32 sz = regs.internal.pipeline.command_buffer.GetSize(idx);
+                const u8* h = memory.GetPhysicalPointer(addr);
+                cmd_list.Reset(addr, h, sz);
+                break;
+            }
+
+            // VS program code — increment offset, skip UpdateProgramCode.
+            case PICA_REG_INDEX(vs.program.set_word[0]):
+            case PICA_REG_INDEX(vs.program.set_word[1]):
+            case PICA_REG_INDEX(vs.program.set_word[2]):
+            case PICA_REG_INDEX(vs.program.set_word[3]):
+            case PICA_REG_INDEX(vs.program.set_word[4]):
+            case PICA_REG_INDEX(vs.program.set_word[5]):
+            case PICA_REG_INDEX(vs.program.set_word[6]):
+            case PICA_REG_INDEX(vs.program.set_word[7]):
+                if (regs.internal.vs.program.offset < 512) {
+                    regs.internal.vs.program.offset++;
+                }
+                break;
+
+            // VS swizzle patterns — increment offset, skip UpdateSwizzleData.
+            case PICA_REG_INDEX(vs.swizzle_patterns.set_word[0]):
+            case PICA_REG_INDEX(vs.swizzle_patterns.set_word[1]):
+            case PICA_REG_INDEX(vs.swizzle_patterns.set_word[2]):
+            case PICA_REG_INDEX(vs.swizzle_patterns.set_word[3]):
+            case PICA_REG_INDEX(vs.swizzle_patterns.set_word[4]):
+            case PICA_REG_INDEX(vs.swizzle_patterns.set_word[5]):
+            case PICA_REG_INDEX(vs.swizzle_patterns.set_word[6]):
+            case PICA_REG_INDEX(vs.swizzle_patterns.set_word[7]):
+                if (regs.internal.vs.swizzle_patterns.offset < vs_setup.GetSwizzleData().size()) {
+                    regs.internal.vs.swizzle_patterns.offset++;
+                }
+                break;
+
+            // GS program code.
+            case PICA_REG_INDEX(gs.program.set_word[0]):
+            case PICA_REG_INDEX(gs.program.set_word[1]):
+            case PICA_REG_INDEX(gs.program.set_word[2]):
+            case PICA_REG_INDEX(gs.program.set_word[3]):
+            case PICA_REG_INDEX(gs.program.set_word[4]):
+            case PICA_REG_INDEX(gs.program.set_word[5]):
+            case PICA_REG_INDEX(gs.program.set_word[6]):
+            case PICA_REG_INDEX(gs.program.set_word[7]):
+                if (regs.internal.gs.program.offset < 4096) {
+                    regs.internal.gs.program.offset++;
+                }
+                break;
+
+            // GS swizzle patterns.
+            case PICA_REG_INDEX(gs.swizzle_patterns.set_word[0]):
+            case PICA_REG_INDEX(gs.swizzle_patterns.set_word[1]):
+            case PICA_REG_INDEX(gs.swizzle_patterns.set_word[2]):
+            case PICA_REG_INDEX(gs.swizzle_patterns.set_word[3]):
+            case PICA_REG_INDEX(gs.swizzle_patterns.set_word[4]):
+            case PICA_REG_INDEX(gs.swizzle_patterns.set_word[5]):
+            case PICA_REG_INDEX(gs.swizzle_patterns.set_word[6]):
+            case PICA_REG_INDEX(gs.swizzle_patterns.set_word[7]):
+                if (regs.internal.gs.swizzle_patterns.offset < gs_setup.GetSwizzleData().size()) {
+                    regs.internal.gs.swizzle_patterns.offset++;
+                }
+                break;
+
+            // Lighting LUT data — increment index, skip data write.
+            case PICA_REG_INDEX(lighting.lut_data[0]):
+            case PICA_REG_INDEX(lighting.lut_data[1]):
+            case PICA_REG_INDEX(lighting.lut_data[2]):
+            case PICA_REG_INDEX(lighting.lut_data[3]):
+            case PICA_REG_INDEX(lighting.lut_data[4]):
+            case PICA_REG_INDEX(lighting.lut_data[5]):
+            case PICA_REG_INDEX(lighting.lut_data[6]):
+            case PICA_REG_INDEX(lighting.lut_data[7]):
+                regs.internal.lighting.lut_config.index.Assign(
+                    regs.internal.lighting.lut_config.index + 1);
+                break;
+
+            // Fog LUT data — increment offset, skip data write.
+            case PICA_REG_INDEX(texturing.fog_lut_data[0]):
+            case PICA_REG_INDEX(texturing.fog_lut_data[1]):
+            case PICA_REG_INDEX(texturing.fog_lut_data[2]):
+            case PICA_REG_INDEX(texturing.fog_lut_data[3]):
+            case PICA_REG_INDEX(texturing.fog_lut_data[4]):
+            case PICA_REG_INDEX(texturing.fog_lut_data[5]):
+            case PICA_REG_INDEX(texturing.fog_lut_data[6]):
+            case PICA_REG_INDEX(texturing.fog_lut_data[7]):
+                regs.internal.texturing.fog_lut_offset.Assign(
+                    regs.internal.texturing.fog_lut_offset + 1);
+                break;
+
+            // Proctex LUT data — increment index, skip data write.
+            case PICA_REG_INDEX(texturing.proctex_lut_data[0]):
+            case PICA_REG_INDEX(texturing.proctex_lut_data[1]):
+            case PICA_REG_INDEX(texturing.proctex_lut_data[2]):
+            case PICA_REG_INDEX(texturing.proctex_lut_data[3]):
+            case PICA_REG_INDEX(texturing.proctex_lut_data[4]):
+            case PICA_REG_INDEX(texturing.proctex_lut_data[5]):
+            case PICA_REG_INDEX(texturing.proctex_lut_data[6]):
+            case PICA_REG_INDEX(texturing.proctex_lut_data[7]):
+                regs.internal.texturing.proctex_lut_config.index.Assign(
+                    regs.internal.texturing.proctex_lut_config.index + 1);
+                break;
+
+            default:
+                break;
+            }
+        };
+
+        // Process the first entry + extras — same structure as the full parser.
+        write_shallow(header.cmd_id, value);
+        for (u32 i = 0; i < header.extra_data_length; ++i) {
+            if (stop_requested) [[unlikely]] {
+                break;
+            }
+            const u32 cmd = header.cmd_id + (header.group_commands ? i + 1 : 0);
+            const u32 extra_value = cmd_list.head[cmd_list.current_index++];
+            write_shallow(cmd, extra_value);
+        }
+    }
+}
+
 static bool any_byte_match(u32 a, u32 b) {
     return ((a & 0xFF) == (b & 0xFF)) || (((a >> 8) & 0xFF) == ((b >> 8) & 0xFF)) ||
            (((a >> 16) & 0xFF) == ((b >> 16) & 0xFF)) || (((a >> 24) & 0xFF) == ((b >> 24) & 0xFF));

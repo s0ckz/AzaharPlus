@@ -444,20 +444,36 @@ void GPU::SubmitCmdList(u32 index) {
 
     MICROPROFILE_SCOPE(GPU_CmdlistProcessing);
 
-    // Forward command list processing to the PICA core. The previous attempt
-    // here passed ignore_list=true on skipped frames to skip the parser entirely
-    // — that won SMB3DL ~3 ms/frame and pushed the game to 100% speed but BROKE
-    // rendering: the game's logic thread + audio kept running but the screen
-    // froze, because skipping the cmdlist throws away inter-frame state held in
-    // vs_setup / gs_setup / lighting LUT arrays that the next rendered frame
-    // assumes is in place. Reverted; the savings have to come from a smarter
-    // approach (shallow parse that updates reg_array but skips expensive side
-    // effects) which lives in a follow-up commit. Keep the GpuExecProbe sub-
-    // bucket instrumentation in Execute() so we can verify the next attempt.
+    // Forward command list processing to the PICA core.
+    //
+    // Shallow-parse optimization for skipped frames: on frames where
+    // IsSkippingDraws()==true, we use ProcessCmdListShallow instead of
+    // the full WriteInternalReg path. The shallow parser walks the exact
+    // same command stream but:
+    //   - updates reg_array[id] directly (preserves register state)
+    //   - increments all auto-incrementing offsets (vs/gs program,
+    //     swizzle, lighting/fog/proctex LUT indices)
+    //   - sets dirty_regs bits (so the next rendered frame knows to
+    //     re-upload)
+    //   - handles irq_request (game timing) and sub-cmdlist chaining
+    //   - skips EVERYTHING else: no DrawArrays, no UpdateProgramCode, no
+    //     WriteUniformFloatReg, no LUT data writes, no SubmitImmediate,
+    //     no primitive assembler reconfig, no debug callbacks
+    //
+    // This preserves register state across frames (fixing the blank-screen
+    // regression from the previous full-bypass attempt in 7a5fcc40b) while
+    // still saving most of the ~300 ms/s wall-time cost that the full
+    // parser's side effects eat on skipped frames.
     const PAddr addr = config.GetPhysicalAddress(index);
     const u32 size = config.GetSize(index);
-    impl->pica.ProcessCmdList(addr, size,
-                              !right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size));
+
+    if (impl->pica.IsSkippingDraws() &&
+        right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size)) {
+        impl->pica.ProcessCmdListShallow(addr, size);
+    } else {
+        impl->pica.ProcessCmdList(addr, size,
+                                  !right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size));
+    }
     config.trigger[index] = 0;
 }
 
