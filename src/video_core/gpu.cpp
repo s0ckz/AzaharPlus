@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <chrono>
 #include "common/archives.h"
 #include "common/hacks/hack_manager.h"
 #include "common/microprofile.h"
@@ -468,6 +469,45 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     impl->pica.SetSkipDraws(skip_draws);
     impl->skip_gpu_transfers =
         next_is_skip && (mode == Settings::FrameSkipMode::SkipAllGpu);
+
+    // Rate-limited diagnostic: dump the effective frame-skip state once a second so we
+    // can confirm from logcat whether the setting is actually applied at runtime, and
+    // how many frames in each decision-bucket we saw over the last second. PerfProbe's
+    // per-frame averages mask this because skipped and unskipped frames both count in
+    // system_frames but contribute very different per-bucket costs.
+    static u64 skip_log_last_ms = 0;
+    static u32 skip_log_skipped = 0;
+    static u32 skip_log_total = 0;
+    ++skip_log_total;
+    if (next_is_skip) {
+        ++skip_log_skipped;
+    }
+    const u64 now_ms = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    if (now_ms - skip_log_last_ms >= 1000) {
+        const char* mode_name = "?";
+        switch (mode) {
+        case Settings::FrameSkipMode::PresentOnly:
+            mode_name = "PresentOnly";
+            break;
+        case Settings::FrameSkipMode::SkipDraws:
+            mode_name = "SkipDraws";
+            break;
+        case Settings::FrameSkipMode::SkipAllGpu:
+            mode_name = "SkipAllGpu";
+            break;
+        }
+        LOG_INFO(HW_GPU,
+                 "FrameSkipProbe frame_skip={} mode={} vblanks_last_s={} skipped_last_s={}"
+                 " next_is_skip={} skip_draws={} skip_gpu_transfers={}",
+                 frame_skip, mode_name, skip_log_total, skip_log_skipped, next_is_skip,
+                 skip_draws, impl->skip_gpu_transfers);
+        skip_log_last_ms = now_ms;
+        skip_log_total = 0;
+        skip_log_skipped = 0;
+    }
 
     // Reschedule recurrent event
     impl->timing.ScheduleEvent(FRAME_TICKS - cycles_late, impl->vblank_event);
