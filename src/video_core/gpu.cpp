@@ -444,34 +444,20 @@ void GPU::SubmitCmdList(u32 index) {
 
     MICROPROFILE_SCOPE(GPU_CmdlistProcessing);
 
-    // Forward command list processing to the PICA core.
-    //
-    // Aggressive frame-skip optimization: when the PICA core has been told
-    // IsSkippingDraws()==true for the current vblank, we bypass the entire PICA
-    // command-list parser by passing ignore_list=true to ProcessCmdList(). That
-    // path just signals the P3D completion interrupt (which the game waits on)
-    // and returns, skipping the ~thousands of WriteInternalReg calls per frame
-    // that otherwise dominate the PerfProbe 'gpu' bucket in SMB3DL (~300 ms/s
-    // of emu-thread wall time, measured via the GpuExecProbe sub-bucket).
-    //
-    // Why this is safe for nearly all games: 3DS titles submit self-contained
-    // GSP command lists that re-upload their pipeline state (shaders, uniforms,
-    // textures, draw parameters) on every single rendered frame. Skipping a
-    // cmdlist on a skipped frame means the register state briefly diverges,
-    // but the NEXT rendered frame's cmdlist re-establishes correct state from
-    // scratch. The game's logic thread is decoupled from the PICA pipeline
-    // entirely — it only observes the P3D interrupt, which we still fire.
-    //
-    // The one class of games this could break is homebrew / demos that use an
-    // incremental state model (update one uniform between triggers, leave the
-    // rest persistent). For those, turn off SkipAllGpu mode and fall back to
-    // frame-skip SkipDraws (which still runs the parser but elides DrawArrays
-    // at the end) or PresentOnly.
+    // Forward command list processing to the PICA core. The previous attempt
+    // here passed ignore_list=true on skipped frames to skip the parser entirely
+    // — that won SMB3DL ~3 ms/frame and pushed the game to 100% speed but BROKE
+    // rendering: the game's logic thread + audio kept running but the screen
+    // froze, because skipping the cmdlist throws away inter-frame state held in
+    // vs_setup / gs_setup / lighting LUT arrays that the next rendered frame
+    // assumes is in place. Reverted; the savings have to come from a smarter
+    // approach (shallow parse that updates reg_array but skips expensive side
+    // effects) which lives in a follow-up commit. Keep the GpuExecProbe sub-
+    // bucket instrumentation in Execute() so we can verify the next attempt.
     const PAddr addr = config.GetPhysicalAddress(index);
     const u32 size = config.GetSize(index);
-    const bool ignore =
-        !right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size) || impl->pica.IsSkippingDraws();
-    impl->pica.ProcessCmdList(addr, size, ignore);
+    impl->pica.ProcessCmdList(addr, size,
+                              !right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size));
     config.trigger[index] = 0;
 }
 
