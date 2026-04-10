@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+#
+# Local Dockerized Android build for the 30fps optimization sprint.
+#
+# Builds the toolchain image once (Android SDK 35 + NDK 27.1.12297006 +
+# CMake 3.30.3 + JDK 17 + ccache; ~2.5 GB image, slow first build) and then
+# runs gradle inside the container with the source tree, ccache, and the
+# gradle home all mounted as host volumes so subsequent builds are fully
+# incremental.
+#
+# Usage:
+#   docker/android-build/build-android.sh
+#       Default — runs `assembleVanillaRelease --stacktrace`. Produces a
+#       sideload-installable signed-with-debug-key APK at:
+#         src/android/app/build/outputs/apk/vanilla/release/
+#
+#   docker/android-build/build-android.sh assembleRelease
+#       Both flavors (vanilla AND googlePlay). Slower; only needed if you
+#       care about the GooglePlay flavor.
+#
+#   docker/android-build/build-android.sh clean assembleVanillaRelease
+#       Pass arbitrary gradle args. Anything after the script name is
+#       forwarded verbatim to ./gradlew.
+#
+#   docker/android-build/build-android.sh shell
+#       Drop into an interactive bash inside the container with the
+#       workspace and caches mounted. Useful for poking at the build state.
+#
+#   docker/android-build/build-android.sh --rebuild-image
+#       Force a `docker build --no-cache` of the toolchain image. Use this
+#       if you've edited the Dockerfile and want a clean image. Combine with
+#       gradle args, e.g.:
+#         build-android.sh --rebuild-image assembleVanillaRelease
+#
+# Caches:
+#   Two named docker volumes are used and persist across runs:
+#     azahar-android-ccache  → /ccache       (NDK clang ccache)
+#     azahar-android-gradle  → /root/.gradle (gradle wrapper, deps, build cache)
+#
+#   To wipe a cache:
+#     docker volume rm azahar-android-ccache
+#     docker volume rm azahar-android-gradle
+#
+# Notes for Windows + Git Bash users:
+#   - Set MSYS_NO_PATHCONV=1 (this script does that for you) to keep Git Bash
+#     from mangling docker volume mount paths.
+#   - Make sure Docker Desktop has the drive containing the repo enabled
+#     under Settings -> Resources -> File sharing. The first build will be
+#     slow because of host->container file sync; subsequent rebuilds touch
+#     much less data.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+
+# On Git Bash / MSYS / Cygwin the bash REPO_ROOT looks like /c/Users/... but
+# Docker on Windows wants C:/Users/... — convert with cygpath -m if available.
+# No-op on Linux/macOS.
+if command -v cygpath >/dev/null 2>&1; then
+    REPO_ROOT="$(cygpath -m "$REPO_ROOT")"
+fi
+
+DOCKERFILE_DIR="$REPO_ROOT/docker/android-build"
+IMAGE_TAG="azahar-android-build:latest"
+CCACHE_VOL="azahar-android-ccache"
+GRADLE_VOL="azahar-android-gradle"
+
+# Disable Git Bash path translation; docker on Windows otherwise rewrites
+# /workspace into something like C:/Program Files/Git/workspace. Harmless
+# on Linux/macOS.
+export MSYS_NO_PATHCONV=1
+
+# Argument parsing.
+REBUILD_IMAGE=0
+GRADLE_ARGS=()
+INTERACTIVE_SHELL=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --rebuild-image)
+            REBUILD_IMAGE=1
+            shift
+            ;;
+        shell)
+            INTERACTIVE_SHELL=1
+            shift
+            ;;
+        *)
+            GRADLE_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [ "$INTERACTIVE_SHELL" -eq 0 ] && [ "${#GRADLE_ARGS[@]}" -eq 0 ]; then
+    GRADLE_ARGS=("assembleVanillaRelease" "--stacktrace")
+fi
+
+# Pretty header so script output is greppable in long terminals.
+echo "================================================================"
+echo " azahar android local build"
+echo " repo:    $REPO_ROOT"
+echo " image:   $IMAGE_TAG"
+echo " ccache:  $CCACHE_VOL"
+echo " gradle:  $GRADLE_VOL"
+if [ "$INTERACTIVE_SHELL" -eq 1 ]; then
+    echo " action:  interactive shell"
+else
+    echo " gradle:  ${GRADLE_ARGS[*]}"
+fi
+echo "================================================================"
+
+# Build the toolchain image. Layer-cached unless the Dockerfile changed; the
+# slow part (NDK + sdkmanager) is the last layer so source-only edits never
+# invalidate it.
+if [ "$REBUILD_IMAGE" -eq 1 ]; then
+    echo ">>> Rebuilding image from scratch (--rebuild-image)..."
+    docker build --no-cache -t "$IMAGE_TAG" "$DOCKERFILE_DIR"
+else
+    echo ">>> Building/updating image (cached layers reused)..."
+    docker build -t "$IMAGE_TAG" "$DOCKERFILE_DIR"
+fi
+
+echo ">>> Ensuring named cache volumes exist..."
+docker volume create "$CCACHE_VOL" >/dev/null
+docker volume create "$GRADLE_VOL" >/dev/null
+
+# Common docker run flags. We use --rm so containers don't pile up; the caches
+# persist via the named volumes regardless.
+RUN_FLAGS=(
+    --rm
+    -v "$REPO_ROOT:/workspace"
+    -v "$CCACHE_VOL:/ccache"
+    -v "$GRADLE_VOL:/root/.gradle"
+    -w /workspace/src/android
+    -e CCACHE_DIR=/ccache
+    -e CCACHE_BASEDIR=/workspace
+    -e CCACHE_COMPRESS=1
+    -e CCACHE_COMPILERCHECK=content
+    -e CCACHE_SLOPPINESS=time_macros,include_file_mtime,include_file_ctime
+    -e NDK_CCACHE=/usr/bin/ccache
+)
+
+if [ "$INTERACTIVE_SHELL" -eq 1 ]; then
+    echo ">>> Opening interactive shell..."
+    docker run -it "${RUN_FLAGS[@]}" "$IMAGE_TAG" bash
+    exit 0
+fi
+
+# Run the gradle build. We invoke gradlew via `bash` rather than relying on
+# its executable bit because Windows host filesystems often don't preserve
+# the +x bit through a bind mount, and `chmod +x` inside the container is
+# silently a no-op when the host fs doesn't support unix permissions.
+echo ">>> Running gradle: ${GRADLE_ARGS[*]}"
+START_TIME=$(date +%s)
+docker run "${RUN_FLAGS[@]}" "$IMAGE_TAG" \
+    bash -c "bash ./gradlew ${GRADLE_ARGS[*]} && ccache -s -v"
+END_TIME=$(date +%s)
+echo ">>> Build finished in $((END_TIME - START_TIME))s"
+
+# Show where the APKs landed for convenience.
+APK_DIR="$REPO_ROOT/src/android/app/build/outputs/apk"
+if [ -d "$APK_DIR" ]; then
+    echo
+    echo ">>> APKs produced:"
+    find "$APK_DIR" -name "*.apk" 2>/dev/null | while read -r apk; do
+        size=$(stat --format='%s' "$apk" 2>/dev/null || stat -f '%z' "$apk" 2>/dev/null || echo "?")
+        echo "    $apk  ($size bytes)"
+    done
+    echo
+    echo ">>> To install on a connected device:"
+    echo "    adb install -r <path-to-apk>"
+fi
