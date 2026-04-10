@@ -83,6 +83,11 @@ struct GpuExecCounters {
     std::uint64_t dma_ns = 0;
     std::uint64_t other_n = 0;
     std::uint64_t other_ns = 0;
+    // Diagnostic: count SetSkipDraws calls (true vs false) to confirm whether
+    // VBlankCallback is actually calling it during the sample window. Compare
+    // against cmdlist_bypass_n to debug why the shallow path isn't firing.
+    std::uint64_t set_skip_true = 0;
+    std::uint64_t set_skip_false = 0;
 };
 GpuExecCounters g_gpu_exec;
 
@@ -611,6 +616,11 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     const bool skip_draws = next_is_skip && (mode == Settings::FrameSkipMode::SkipDraws ||
                                               mode == Settings::FrameSkipMode::SkipAllGpu);
     impl->pica.SetSkipDraws(skip_draws);
+    if (skip_draws) {
+        ++g_gpu_exec.set_skip_true;
+    } else {
+        ++g_gpu_exec.set_skip_false;
+    }
     impl->skip_gpu_transfers =
         next_is_skip && (mode == Settings::FrameSkipMode::SkipAllGpu);
 
@@ -673,11 +683,12 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
         // equal (PerfProbe gpu per-frame × vblanks_last_s).
         LOG_INFO(HW_GPU,
                  "GpuExecProbe cmdlist[n={} ms={:.2f}] cmdlist_bypass[n={} ms={:.2f}] "
-                 "dma[n={} ms={:.2f}] other[n={} ms={:.2f}]",
+                 "dma[n={} ms={:.2f}] other[n={} ms={:.2f}] set_skip[t={} f={}]",
                  g_gpu_exec.cmdlist_n, g_gpu_exec.cmdlist_ns / 1.0e6,
                  g_gpu_exec.cmdlist_bypass_n, g_gpu_exec.cmdlist_bypass_ns / 1.0e6,
                  g_gpu_exec.dma_n, g_gpu_exec.dma_ns / 1.0e6,
-                 g_gpu_exec.other_n, g_gpu_exec.other_ns / 1.0e6);
+                 g_gpu_exec.other_n, g_gpu_exec.other_ns / 1.0e6,
+                 g_gpu_exec.set_skip_true, g_gpu_exec.set_skip_false);
         g_gpu_exec = GpuExecCounters{};
 
         skip_log_last_ms = now_ms;
