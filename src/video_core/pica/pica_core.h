@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include "common/common_types.h"
 #include "core/hle/service/gsp/gsp_interrupt.h"
 #include "video_core/pica/dirty_regs.h"
@@ -55,13 +56,18 @@ public:
 
     /// When true, DrawArrays/DrawImmediate are no-op'd so PICA vertex shaders
     /// and rasterizer draw submission don't run on the host for the current
-    /// frame. Used by the aggressive frame-skip mode.
+    /// frame. Used by the aggressive frame-skip mode. Atomic with relaxed
+    /// ordering because the writer (VBlankCallback) and reader (Execute) sit
+    /// in different inlining contexts under LTO, and previously the reader
+    /// was constant-folding the load to false in the optimized build despite
+    /// VBlankCallback writing true 24x/sec — adding atomic forces an actual
+    /// load instruction on every IsSkippingDraws() invocation.
     void SetSkipDraws(bool skip) {
-        skip_draws = skip;
+        skip_draws.store(skip, std::memory_order_relaxed);
     }
 
     bool IsSkippingDraws() const {
-        return skip_draws;
+        return skip_draws.load(std::memory_order_relaxed);
     }
 
 private:
@@ -341,7 +347,7 @@ private:
     GeometryPipeline geometry_pipeline;
     PrimitiveAssembler primitive_assembler;
     CommandList cmd_list;
-    bool skip_draws{false};
+    std::atomic<bool> skip_draws{false};
     std::unique_ptr<ShaderEngine> shader_engine;
 };
 
