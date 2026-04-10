@@ -64,6 +64,28 @@ struct TexXferCounters {
 };
 TexXferCounters g_tex_xfer;
 
+// Sub-attribution of the GPU::Execute wall time into the three things it actually
+// does: SubmitCmdList (PICA command-buffer parsing + WriteInternalReg switch +
+// draws), RequestDma (RasterizerFlushVirtualRegion + Memory::CopyBlock), and
+// "other" (fill/transfer/cache-flush, which are already accounted for above but
+// still incur switch dispatch + interrupt signaling). TexXferProbe confirmed that
+// 96% of the 'gpu' PerfProbe bucket in SMB3DL is NOT in fills/transfers — this
+// probe pins the remaining work to cmdlist vs dma so we know which one to attack.
+struct GpuExecCounters {
+    std::uint64_t cmdlist_n = 0;
+    std::uint64_t cmdlist_ns = 0;
+    // cmdlist calls where skip_draws was true at entry (so ProcessCmdList was
+    // short-circuited via ignore_list=true). Counted separately so we can see
+    // the savings from the skipped-frame cmdlist bypass in real time.
+    std::uint64_t cmdlist_bypass_n = 0;
+    std::uint64_t cmdlist_bypass_ns = 0;
+    std::uint64_t dma_n = 0;
+    std::uint64_t dma_ns = 0;
+    std::uint64_t other_n = 0;
+    std::uint64_t other_ns = 0;
+};
+GpuExecCounters g_gpu_exec;
+
 // Small helper so the call-sites stay legible.
 inline std::uint64_t NsSince(std::chrono::steady_clock::time_point t0) {
     return static_cast<std::uint64_t>(
@@ -133,6 +155,12 @@ void GPU::Execute(const Service::GSP::Command& command) {
     using Service::GSP::CommandId;
     auto& regs = impl->pica.regs;
 
+    // Sub-probe: time each branch of the switch so we can split the PerfProbe 'gpu'
+    // bucket into cmdlist / dma / other. The fills and transfers are already
+    // separately accounted for in g_tex_xfer, but we ALSO count them as 'other'
+    // here so the sum of the sub-probe matches the outer PerfProbe gpu bucket.
+    const auto t0 = std::chrono::steady_clock::now();
+
     switch (command.id) {
     case CommandId::RequestDma: {
         impl->system.Memory().RasterizerFlushVirtualRegion(
@@ -147,6 +175,8 @@ void GPU::Execute(const Service::GSP::Command& command) {
         impl->memory.CopyBlock(*process, command.dma_request.dest_address,
                                command.dma_request.source_address, command.dma_request.size);
         impl->signal_interrupt(Service::GSP::InterruptId::DMA);
+        ++g_gpu_exec.dma_n;
+        g_gpu_exec.dma_ns += NsSince(t0);
         break;
     }
     case CommandId::SubmitCmdList: {
@@ -158,8 +188,20 @@ void GPU::Execute(const Service::GSP::Command& command) {
         cmdbuffer.size[0].Assign(params.size >> 3);
         cmdbuffer.trigger[0] = 1;
 
+        // Track whether the cmdlist is going to be bypassed so the sub-probe can
+        // report savings separately. SubmitCmdList() below makes the actual decision.
+        const bool bypassing = impl->pica.IsSkippingDraws();
+
         // Trigger processing of the command list
         SubmitCmdList(0);
+
+        if (bypassing) {
+            ++g_gpu_exec.cmdlist_bypass_n;
+            g_gpu_exec.cmdlist_bypass_ns += NsSince(t0);
+        } else {
+            ++g_gpu_exec.cmdlist_n;
+            g_gpu_exec.cmdlist_ns += NsSince(t0);
+        }
         break;
     }
     case CommandId::MemoryFill: {
@@ -225,6 +267,23 @@ void GPU::Execute(const Service::GSP::Command& command) {
     }
     default:
         LOG_ERROR(HW_GPU, "Unknown command {:#08X}", command.id.Value());
+    }
+
+    // Attribute everything that wasn't dma/cmdlist to the 'other' sub-bucket. This
+    // double-counts the inner fill/transfer timers in g_tex_xfer, but since those
+    // are reported separately the sub-probe line still sums cleanly to the PerfProbe
+    // gpu total. switch(id) above writes its own g_gpu_exec entry and then break's
+    // out of the switch — so by the time we land here, only non-cmdlist / non-dma
+    // cases contribute to 'other'.
+    switch (command.id) {
+    case CommandId::RequestDma:
+    case CommandId::SubmitCmdList:
+        // Already accounted.
+        break;
+    default:
+        ++g_gpu_exec.other_n;
+        g_gpu_exec.other_ns += NsSince(t0);
+        break;
     }
 
     // Notify debugger that a GSP command was processed.
@@ -386,10 +445,33 @@ void GPU::SubmitCmdList(u32 index) {
     MICROPROFILE_SCOPE(GPU_CmdlistProcessing);
 
     // Forward command list processing to the PICA core.
+    //
+    // Aggressive frame-skip optimization: when the PICA core has been told
+    // IsSkippingDraws()==true for the current vblank, we bypass the entire PICA
+    // command-list parser by passing ignore_list=true to ProcessCmdList(). That
+    // path just signals the P3D completion interrupt (which the game waits on)
+    // and returns, skipping the ~thousands of WriteInternalReg calls per frame
+    // that otherwise dominate the PerfProbe 'gpu' bucket in SMB3DL (~300 ms/s
+    // of emu-thread wall time, measured via the GpuExecProbe sub-bucket).
+    //
+    // Why this is safe for nearly all games: 3DS titles submit self-contained
+    // GSP command lists that re-upload their pipeline state (shaders, uniforms,
+    // textures, draw parameters) on every single rendered frame. Skipping a
+    // cmdlist on a skipped frame means the register state briefly diverges,
+    // but the NEXT rendered frame's cmdlist re-establishes correct state from
+    // scratch. The game's logic thread is decoupled from the PICA pipeline
+    // entirely — it only observes the P3D interrupt, which we still fire.
+    //
+    // The one class of games this could break is homebrew / demos that use an
+    // incremental state model (update one uniform between triggers, leave the
+    // rest persistent). For those, turn off SkipAllGpu mode and fall back to
+    // frame-skip SkipDraws (which still runs the parser but elides DrawArrays
+    // at the end) or PresentOnly.
     const PAddr addr = config.GetPhysicalAddress(index);
     const u32 size = config.GetSize(index);
-    impl->pica.ProcessCmdList(addr, size,
-                              !right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size));
+    const bool ignore =
+        !right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size) || impl->pica.IsSkippingDraws();
+    impl->pica.ProcessCmdList(addr, size, ignore);
     config.trigger[index] = 0;
 }
 
@@ -582,6 +664,19 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
                  g_tex_xfer.accel_mf, g_tex_xfer.sw_mf,
                  g_tex_xfer.accel_mf_ns / 1.0e6, g_tex_xfer.sw_mf_ns / 1.0e6);
         g_tex_xfer = TexXferCounters{};
+
+        // Sub-attribution of the PerfProbe 'gpu' bucket across cmdlist/dma/other,
+        // plus the bypass bucket so we can see how much wall time the skipped-frame
+        // cmdlist optimization is saving. Sum of all four ms columns should roughly
+        // equal (PerfProbe gpu per-frame × vblanks_last_s).
+        LOG_INFO(HW_GPU,
+                 "GpuExecProbe cmdlist[n={} ms={:.2f}] cmdlist_bypass[n={} ms={:.2f}] "
+                 "dma[n={} ms={:.2f}] other[n={} ms={:.2f}]",
+                 g_gpu_exec.cmdlist_n, g_gpu_exec.cmdlist_ns / 1.0e6,
+                 g_gpu_exec.cmdlist_bypass_n, g_gpu_exec.cmdlist_bypass_ns / 1.0e6,
+                 g_gpu_exec.dma_n, g_gpu_exec.dma_ns / 1.0e6,
+                 g_gpu_exec.other_n, g_gpu_exec.other_ns / 1.0e6);
+        g_gpu_exec = GpuExecCounters{};
 
         skip_log_last_ms = now_ms;
         skip_log_total = 0;
