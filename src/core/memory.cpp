@@ -648,9 +648,26 @@ std::string MemorySystem::ReadCString(VAddr vaddr, std::size_t max_length) {
 }
 
 MemorySystem::PhysMemRegionInfo MemorySystem::GetPhysMemRegionInfo(PAddr address) {
-    if (address >= phys_mem_region_info_cache.region_start &&
-        address < phys_mem_region_info_cache.region_end) {
-        return phys_mem_region_info_cache;
+    // ROOT CAUSE OF MULTIPLE GpuWorker CRASHES: this 1-entry cache used
+    // to be a member of MemorySystem, shared by all threads. With the
+    // GpuWorker thread reading guest memory concurrently with the emu
+    // thread's dynarec, both threads racing the cache produced torn
+    // (region_start, region_end, backing_mem) tuples — one thread
+    // would observe e.g. region_start from a CACHED entry and
+    // backing_mem from a NEW lookup, returning a MemoryRef into the
+    // wrong backing buffer. Crash signatures included
+    //   - FindMinMax+64 / SetupIndexArray / SetupVertexArray SIGSEGVs
+    //     reading random heap addresses
+    //   - MemoryRef::operator() ASSERT (offset > backing size)
+    //   - AccelerateDrawBatchInternal+164 SIGSEGV at offset 0x10
+    //
+    // Fix: thread_local cache. Each thread keeps its own. Linear lookup
+    // on a cache miss is 4 entries; the cache hit case is the 99%+
+    // dynarec hot path so we keep it.
+    thread_local PhysMemRegionInfo cache{};
+
+    if (address >= cache.region_start && address < cache.region_end) {
+        return cache;
     }
 
     constexpr std::array memory_areas = {
@@ -669,28 +686,28 @@ MemorySystem::PhysMemRegionInfo MemorySystem::GetPhysMemRegionInfo(PAddr address
     if (area == memory_areas.end()) [[unlikely]] {
         LOG_ERROR(HW_Memory, "Unknown GetPhysMemRegionInfo @ {:#08X} at PC {:#08X}", address,
                   impl->GetPC());
-        phys_mem_region_info_cache = PhysMemRegionInfo();
-        return phys_mem_region_info_cache;
+        cache = PhysMemRegionInfo();
+        return cache;
     }
 
     switch (area->first) {
     case VRAM_PADDR:
-        phys_mem_region_info_cache = {&impl->vram_mem, area->first, area->second};
+        cache = {&impl->vram_mem, area->first, area->second};
         break;
     case DSP_RAM_PADDR:
-        phys_mem_region_info_cache = {&impl->dsp_mem, area->first, area->second};
+        cache = {&impl->dsp_mem, area->first, area->second};
         break;
     case FCRAM_PADDR:
-        phys_mem_region_info_cache = {&impl->fcram_mem, area->first, area->second};
+        cache = {&impl->fcram_mem, area->first, area->second};
         break;
     case N3DS_EXTRA_RAM_PADDR:
-        phys_mem_region_info_cache = {&impl->n3ds_extra_ram_mem, area->first, area->second};
+        cache = {&impl->n3ds_extra_ram_mem, area->first, area->second};
         break;
     default:
         UNREACHABLE();
     }
 
-    return phys_mem_region_info_cache;
+    return cache;
 }
 
 u8* MemorySystem::GetPhysicalPointer(PAddr address) {

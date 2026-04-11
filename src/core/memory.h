@@ -694,7 +694,10 @@ private:
     class Impl;
     std::unique_ptr<Impl> impl;
 
-    PhysMemRegionInfo phys_mem_region_info_cache{};
+    // (was: PhysMemRegionInfo phys_mem_region_info_cache{};)
+    // The 1-entry physical-region cache moved to a thread_local inside
+    // GetPhysMemRegionInfo to fix a multi-thread race that caused
+    // SIGSEGVs in the GpuWorker — see the long comment in memory.cpp.
 
     friend class boost::serialization::access;
     template <class Archive>
