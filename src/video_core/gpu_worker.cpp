@@ -50,12 +50,14 @@ void GpuWorker::Stop() {
     }
     if (thread) {
         thread->request_stop();
-        // Poke the condvar so the worker observes the stop_token.
+        // Poke both condvars so the worker observes the stop_token AND
+        // any producer blocked in back-pressure wakes up to bail out.
         {
             std::scoped_lock lock{queue_mutex};
             queue.push(GpuCmdFlush{});
         }
         queue_cv.notify_one();
+        producer_cv.notify_all();
         thread.reset(); // joins
     }
     gpu_owner = nullptr;
@@ -63,8 +65,25 @@ void GpuWorker::Stop() {
 }
 
 void GpuWorker::Push(GpuMessage msg) {
+    const bool is_execute = std::holds_alternative<GpuCmdExecute>(msg);
+    // Re-entry guard: if a worker-side handler somehow ends up calling
+    // Push() (e.g. an interrupt path that fans out to another GPU public
+    // method without the IsOnWorkerThread short-circuit) we MUST NOT block
+    // on producer_cv — only the worker can drain the queue, so waiting
+    // for ourselves would deadlock. Skip back-pressure in that case.
+    const bool from_worker = IsOnWorkerThread();
     {
-        std::scoped_lock lock{queue_mutex};
+        std::unique_lock lock{queue_mutex};
+        if (is_execute && !from_worker) {
+            // Block until the worker has drained enough Execute commands
+            // to make room. running=false also wakes us so shutdown
+            // doesn't deadlock.
+            producer_cv.wait(lock, [this] {
+                return pending_execute_count < kPendingExecuteHighWatermark ||
+                       !running.load(std::memory_order_acquire);
+            });
+            ++pending_execute_count;
+        }
         queue.push(std::move(msg));
     }
     queue_cv.notify_one();
@@ -107,6 +126,16 @@ void GpuWorker::Loop(std::stop_token stop) {
                 using T = std::decay_t<decltype(cmd)>;
                 if constexpr (std::is_same_v<T, GpuCmdExecute>) {
                     gpu_owner->ExecuteOnWorker(cmd.command);
+                    // Release one slot of the back-pressure budget and
+                    // wake any producer blocked in Push(). The notify is
+                    // cheap; if no producer is waiting it's a no-op.
+                    {
+                        std::scoped_lock lock{queue_mutex};
+                        if (pending_execute_count > 0) {
+                            --pending_execute_count;
+                        }
+                    }
+                    producer_cv.notify_one();
                 } else if constexpr (std::is_same_v<T, GpuCmdVBlank>) {
                     gpu_owner->VBlankOnWorker(cmd.cycles_late);
                 } else if constexpr (std::is_same_v<T, GpuCmdSetBufferSwap>) {

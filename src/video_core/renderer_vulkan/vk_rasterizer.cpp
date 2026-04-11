@@ -307,6 +307,16 @@ void RasterizerVulkan::SetupVertexArray() {
             base_address + loader.data_offset + (vs_input_index_min * loader.byte_count);
         const u32 vertex_num = vs_input_index_max - vs_input_index_min + 1;
         u32 data_size = loader.byte_count * vertex_num;
+
+        // Defensive: data_addr can be transiently bogus during the
+        // GpuWorker race window. GetPhysicalRef ASSERTs if the address
+        // resolves to a region but the offset overflows the backing
+        // size — guard with GetPhysicalPointer first (which returns
+        // nullptr instead of asserting on out-of-region addresses).
+        if (memory.GetPhysicalPointer(data_addr) == nullptr) [[unlikely]] {
+            continue;
+        }
+
         res_cache.FlushRegion(data_addr, data_size);
 
         const MemoryRef src_ref = memory.GetPhysicalRef(data_addr);

@@ -130,7 +130,21 @@ private:
     // represents.
     std::mutex queue_mutex;
     std::condition_variable queue_cv;
+    std::condition_variable producer_cv;
     std::queue<GpuMessage> queue;
+
+    // Back-pressure watermark on Execute messages. With an unbounded queue
+    // the emu thread sprints ahead between VBlanks, then VBlankCallback's
+    // worker.Flush() stalls for a variable amount of time depending on
+    // how much the worker fell behind — hence the "fps seem higher but
+    // less stable" feel. Capping the queue depth converts that one-shot
+    // VBlank stall into a series of small per-Push waits, smoothing
+    // frame pacing without hurting throughput (the emu thread waits the
+    // same total time in steady state, just spread out).
+    //
+    // ~one frame's worth of cmdlists for SMB3DL. Tunable.
+    static constexpr std::size_t kPendingExecuteHighWatermark = 16;
+    std::size_t pending_execute_count{0};
 
     // Flush handshake. The worker calls flush_ack.Set() when it dequeues
     // a GpuCmdFlush; the emu thread waits on it inside Flush().
