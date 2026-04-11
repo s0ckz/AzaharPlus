@@ -17,9 +17,13 @@ on the Anbernic RG DS (RK3568, Mali-G52, Vulkan).
 - **`ProcessCmdList` / `WriteInternalRegAction` / `AccelerateDrawBatch`
   no longer appear** in the emu-thread simpleperf top-30. They've moved
   to the worker.
-- Stable gameplay sessions of **30+ minutes** common; **occasional rare
-  crashes** (~1 every 30-60 minutes) under sustained heavy play. Save
-  state often.
+- **Stable for 100+ minute play sessions** after the final fix
+  (`memory: thread_local PhysMemRegionInfo cache`, commit
+  `39655cb0c`). Earlier intermediate commits had rare ~30-60 min
+  crashes — those came from the shared 1-entry physical-region cache
+  in `MemorySystem` being raced by the worker and emu threads. Hoisting
+  it into a `thread_local` removed every crash signature we'd been
+  chasing.
 
 ## What's on each branch
 
@@ -75,31 +79,22 @@ when those paths read framebuffer_config or run SwapBuffers.
 | `AnalyzeVertexArray` / `SetupIndexArray` / `SetupVertexArray` reading transient bad pica regs and feeding `FindMinMax` / `memcpy` huge sizes or null pointers → SIGSEGV | Defensive bounds checks on `num_vertices` / `vs_input_size` and null checks on `GetPhysicalPointer` / `stream_buffer.Map` |
 | In-flight Surface objects garbage-collected by the rasterizer cache before the worker / Vulkan scheduler finished using them | Bumped `TextureRuntime::RemoveThreshold` from `num_swapchain_images` (2..3) to 240 frames |
 
-## Known remaining issue
+## Known remaining issues
 
-Rare SIGSEGV in worker after extended play (30-60 min sessions). Root
-cause is the rasterizer reading PICA register state in transient
-inconsistent moments — the worker writes pica.regs while parsing the
-cmdlist, then reads them for rasterizer setup. With ARM relaxed memory
-ordering, brief stale reads happen even within one thread's instruction
-stream when other things (cache mutex, vk_scheduler chunk mutex) sit
-between the write and the read.
+Tested for 100+ minute sessions with no crashes after the
+`thread_local PhysMemRegionInfo cache` fix. The defensive bounds
+checks in `AnalyzeVertexArray` / `SetupIndexArray` / `SetupVertexArray`
+remain as belt-and-suspenders for any future memory-region race we
+might still be missing — they can be removed if a clean session
+audit shows they never trip.
 
-The defensive `if (num_vertices > 0x400000) return;` guards in
-`AnalyzeVertexArray`, `SetupIndexArray`, `SetupVertexArray` cover the
-known crash sites. Other rasterizer paths
-(`SetupFixedAttribs`, the software vertex path, texture upload paths)
-have not crashed in testing but could need the same template.
-
-The "real" fix would be either:
-- Lock pica.regs reads with the cache mutex (kills perf — every reg
-  read gates on the lock).
-- Snapshot pica.regs at draw boundaries and have the worker work from
-  the snapshot (significant refactor of `RasterizerVulkan::Draw`).
-- Run the cmdlist parser **and** the rasterizer state setup on the same
-  thread (defeats the worker's purpose).
-
-For now: save state often, accept rare crashes during long sessions.
+Performance dips to ~50-55 fps in heavy scenes (the user's reference
+"heavy spot"), still substantially above the ~44 fps baseline. The
+remaining bottleneck is the dynarec emu thread itself running at ~70%
+of one core; further gains would require parallelizing the ARM11
+Core 0 / Core 1 dynarec onto two host threads, which is a much bigger
+project (Citra's HLE kernel was not designed for concurrent core
+execution).
 
 ## Iterating further
 
