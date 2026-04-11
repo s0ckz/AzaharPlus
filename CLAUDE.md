@@ -1,3 +1,132 @@
+# Multi-core GPU worker (claude/gpu-worker-stable branch)
+
+This branch is the stable result of an autonomous iteration session that
+moved Citra/Azahar's PICA cmdlist processing off the emulation thread
+onto a dedicated `GpuWorker` thread, unlocking the previously-idle cores
+on the Anbernic RG DS (RK3568, Mali-G52, Vulkan).
+
+## Result
+
+- **Sustained 60 fps** in Super Mario 3D Land on the device, vs ~44 fps
+  in heavy spots on the original synchronous build.
+- **Emu thread CPU drops from 88% to 69%** of one core; ~26% of the
+  former emu work now runs on a second physical core (the GpuWorker
+  thread). Plus the Vulkan scheduler worker (~13%) and Mali driver
+  thread (~13%) on additional cores. Total CPU spread across 4 threads
+  instead of pegging one.
+- **`ProcessCmdList` / `WriteInternalRegAction` / `AccelerateDrawBatch`
+  no longer appear** in the emu-thread simpleperf top-30. They've moved
+  to the worker.
+- Stable gameplay sessions of **30+ minutes** common; **occasional rare
+  crashes** (~1 every 30-60 minutes) under sustained heavy play. Save
+  state often.
+
+## What's on each branch
+
+| Branch | State |
+|---|---|
+| `claude/gpu-worker-baseline` | First build that hit 60 fps. Crashes every ~30s in `AccelerateDrawBatchInternal+164`. Not safe to play but useful as a measurement baseline. |
+| `claude/gpu-worker-stable` ← **install this one** | Adds the actual fixes. Boots reliably, runs 60 fps, occasional rare crashes only. |
+
+## Architecture
+
+```
+emu thread (NativeEmulation, nice -20, pinned to cores 0..4):
+  ├── dynarmic JIT (ARM11 Core 0 + Core 1, round-robin)
+  ├── HLE kernel (scheduler, threads, events)
+  ├── HLE services (GSP, DSP, HID, FS, …)
+  ├── core_timing (VBlank, DSP audio tick)
+  └── audio HLE Tick() — synchronous
+
+GpuWorker thread (separate physical core):
+  └── ExecuteOnWorker dispatch:
+      ├── SubmitCmdList → PicaCore::ProcessCmdList → DrawArrays →
+      │     AccelerateDrawBatch → vk_scheduler.Record(...)
+      ├── MemoryFill / DisplayTransfer / TextureCopy
+      └── RequestDma + signal_interrupt(DMA)
+
+Vulkan scheduler worker thread (yet another core):
+  └── Drains command chunks queued by Record(), executes via Mali driver
+
+Mali GPU driver helper threads:
+  └── Background work
+```
+
+The emu thread enqueues `GpuMessage`s onto the worker's queue and
+returns. The worker drains the queue serially. Interrupt firing from
+the worker (P3D, PSC, PPF) is deferred via `Impl::pending_interrupts`
+and drained on the emu thread at the top of every `System::RunLoop`
+slice — `Kernel::Event::Signal` mutates Kernel::Thread state and would
+SIGTRAP the scheduler if invoked off-thread.
+
+VBlank, SetBufferSwap, SetColorFill, Read/WriteReg stay synchronous on
+the emu thread, preceded by `worker.Flush()` so the worker is quiescent
+when those paths read framebuffer_config or run SwapBuffers.
+
+## What was hard
+
+| Problem | Fix |
+|---|---|
+| Worker thread firing GSP interrupts → SIGTRAP in `Kernel::ThreadManager::SwitchContext` | Defer interrupts via `pending_interrupts` queue, drain on emu thread from `System::RunLoop` |
+| `unique_ptr<Impl>::reset()` nulls the pointer **before** running the deleter, so Impl::~Impl's worker.Stop() runs after the worker has already started seeing `this->impl == nullptr` | Explicit `worker.Stop()` in `GPU::~GPU` body before the unique_ptr destructor runs |
+| `Memory::RasterizerMarkRegionCached` writing `attribute = Memory` before installing the page pointer; dynarec then read `attribute=Memory + pointer=null` and asserted | Reorder writes (pointer-then-attribute when arming, attribute-then-pointer when disarming) with a release fence between them |
+| `Vulkan::Scheduler::Record` is single-producer; concurrent writers (worker + emu thread via SwapBuffers / texture upload paths) race the `chunk` member, leading to `chunk->Record(...)` deref of a moved-from `unique_ptr` → SIGSEGV at offset 0x10 | Add `chunk_mutex` protecting `chunk` in `Record` / `DispatchWork` / `SubmitExecution` |
+| `RasterizerCache::FlushRegion` iterates `dirty_regions` (boost::icl::interval_map, a red-black tree) while the worker mutates the same tree | Class-level `recursive_mutex cache_mutex` taken at the top of every public RasterizerCache method body |
+| `AnalyzeVertexArray` / `SetupIndexArray` / `SetupVertexArray` reading transient bad pica regs and feeding `FindMinMax` / `memcpy` huge sizes or null pointers → SIGSEGV | Defensive bounds checks on `num_vertices` / `vs_input_size` and null checks on `GetPhysicalPointer` / `stream_buffer.Map` |
+| In-flight Surface objects garbage-collected by the rasterizer cache before the worker / Vulkan scheduler finished using them | Bumped `TextureRuntime::RemoveThreshold` from `num_swapchain_images` (2..3) to 240 frames |
+
+## Known remaining issue
+
+Rare SIGSEGV in worker after extended play (30-60 min sessions). Root
+cause is the rasterizer reading PICA register state in transient
+inconsistent moments — the worker writes pica.regs while parsing the
+cmdlist, then reads them for rasterizer setup. With ARM relaxed memory
+ordering, brief stale reads happen even within one thread's instruction
+stream when other things (cache mutex, vk_scheduler chunk mutex) sit
+between the write and the read.
+
+The defensive `if (num_vertices > 0x400000) return;` guards in
+`AnalyzeVertexArray`, `SetupIndexArray`, `SetupVertexArray` cover the
+known crash sites. Other rasterizer paths
+(`SetupFixedAttribs`, the software vertex path, texture upload paths)
+have not crashed in testing but could need the same template.
+
+The "real" fix would be either:
+- Lock pica.regs reads with the cache mutex (kills perf — every reg
+  read gates on the lock).
+- Snapshot pica.regs at draw boundaries and have the worker work from
+  the snapshot (significant refactor of `RasterizerVulkan::Draw`).
+- Run the cmdlist parser **and** the rasterizer state setup on the same
+  thread (defeats the worker's purpose).
+
+For now: save state often, accept rare crashes during long sessions.
+
+## Iterating further
+
+The current build is at `claude/gpu-worker-stable`. To check it out and
+build:
+
+```bash
+git checkout claude/gpu-worker-stable
+bash docker/android-build/build-android.sh
+adb install -r src/android/app/build/outputs/apk/vanilla/release/app-vanilla-release.apk
+```
+
+To start fresh from the buggy-but-fast baseline:
+
+```bash
+git checkout claude/gpu-worker-baseline
+```
+
+Useful diagnostic logs:
+```bash
+adb shell "logcat -d | grep -E 'GpuWorkerProbe|GpuIntrProbe|PerfProbe.*speed' | tail -40"
+```
+
+The `GpuWorkerProbe` line shows per-second message-type counts on the
+worker; if `submit=0` for an extended period, the game is stalled, not
+the worker.
+
 # Building Azahar locally
 
 This branch ships a Dockerized Android build so you can produce a signed
