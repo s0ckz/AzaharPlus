@@ -109,7 +109,18 @@ RasterizerAccelerated::VertexArrayInfo RasterizerAccelerated::AnalyzeVertexArray
         const u32 size = count * index_size;
         FlushRegion(address, size);
 
-        if (index_u16) {
+        // Defensive: with the GpuWorker offload there's a tiny chance the
+        // worker reads pica regs in a transient state where num_vertices
+        // is unreasonable, or memory.GetPhysicalPointer returns nullptr
+        // because the index buffer addr was momentarily invalid. Bail out
+        // with neutral min/max instead of FindMinMax-ing a bogus span and
+        // SIGSEGVing inside libcitra-android.so.
+        // 3DS hardware caps num_vertices well below 65536 in practice; we
+        // pick a generous 4M as the panic threshold.
+        if (index_address_8 == nullptr || count == 0 || count > 0x400000) [[unlikely]] {
+            vertex_min = 0;
+            vertex_max = 0;
+        } else if (index_u16) {
             const auto res = Common::FindMinMax({index_address_16, static_cast<size_t>(count)});
             vertex_min = static_cast<u32>(res.first);
             vertex_max = static_cast<u32>(res.second);
