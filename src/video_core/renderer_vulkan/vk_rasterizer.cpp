@@ -233,7 +233,19 @@ void RasterizerVulkan::SyncDrawState() {
 
 void RasterizerVulkan::SetupVertexArray() {
     const auto [vs_input_index_min, vs_input_index_max, vs_input_size] = vertex_info;
+
+    // Defensive: same as SetupIndexArray, guard against transient bad
+    // values from the GpuWorker race against pica reg writes. A bogus
+    // vs_input_size could exhaust the stream buffer or trigger
+    // out-of-bounds memcpy in the per-loader copy below.
+    if (vs_input_size == 0 || vs_input_size > 0x4000000) [[unlikely]] {
+        return;
+    }
+
     auto [array_ptr, array_offset, invalidate] = stream_buffer.Map(vs_input_size, 16);
+    if (array_ptr == nullptr) [[unlikely]] {
+        return;
+    }
 
     /**
      * The Nintendo 3DS has 12 attribute loaders which are used to tell the GPU
@@ -302,9 +314,16 @@ void RasterizerVulkan::SetupVertexArray() {
             LOG_ERROR(Render_Vulkan,
                       "Vertex buffer size {} exceeds available space {} at address {:#016X}",
                       data_size, src_ref.GetSize(), data_addr);
+            // Defensive: clamp to available space so the per-vertex memcpy
+            // below doesn't read past the end of the FCRAM allocation when
+            // a transient torn pica reg gives a bogus loader.byte_count.
+            data_size = static_cast<u32>(src_ref.GetSize());
         }
 
         const u8* src_ptr = src_ref.GetPtr();
+        if (src_ptr == nullptr) [[unlikely]] {
+            continue;
+        }
         u8* dst_ptr = array_ptr + buffer_offset;
 
         // Align stride up if required by Vulkan implementation.
