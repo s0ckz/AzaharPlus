@@ -6,6 +6,7 @@
 
 #include <functional>
 #include <list>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -230,6 +231,21 @@ private:
     Settings::TextureFilter filter;
     bool dump_textures;
     bool use_custom_textures;
+
+    // Coarse-grained recursive mutex protecting all public method bodies.
+    // Both the GpuWorker thread (cmdlist processing → cache lookups +
+    // surface creation) and the emu thread (dynarec memory callbacks →
+    // FlushRegion / InvalidateRegion via memory.cpp) call into this
+    // cache concurrently. Without locking, the boost::icl::interval_map
+    // iteration on one thread races a mutation on another, causing
+    // tree-corruption SIGSEGVs (RasterizerCache::FlushRegion+904 in
+    // tombstones). The lock is brief per call (lookup + a few inserts);
+    // the worker still runs cmdlists in parallel with the emu thread's
+    // dynarec, only the rasterizer cache map ops serialize.
+    //
+    // Recursive because some methods call others (FlushRegion may
+    // invoke ValidateSurface which may call GetSurface, etc.).
+    mutable std::recursive_mutex cache_mutex;
 
     // Per-draw framebuffer-lookup memoization. SMB3DL issues ~100 DrawArrays
     // per frame; many consecutive draws use the IDENTICAL framebuffer config

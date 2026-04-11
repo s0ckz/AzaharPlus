@@ -86,6 +86,7 @@ RasterizerCache<T>::~RasterizerCache() {
 
 template <class T>
 void RasterizerCache<T>::TickFrame() {
+    std::scoped_lock cache_lock{cache_mutex};
     custom_tex_manager.TickFrame();
     RunGarbageCollector();
 
@@ -163,6 +164,7 @@ void RasterizerCache<T>::RemoveTextureCubeFace(SurfaceId surface_id) {
 
 template <class T>
 bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) {
+    std::scoped_lock cache_lock{cache_mutex};
     const DebugScope scope{runtime, Common::Vec4f{0.f, 0.f, 1.f, 1.f},
                            "RasterizerCache::AccelerateTextureCopy ({})", config.DebugName()};
 
@@ -267,6 +269,7 @@ bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig
 
 template <class T>
 bool RasterizerCache<T>::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
+    std::scoped_lock cache_lock{cache_mutex};
     const DebugScope scope{runtime, Common::Vec4f{0.f, 0.f, 1.f, 1.f},
                            "RasterizerCache::AccelerateDisplayTransfer ({})", config.DebugName()};
 
@@ -337,6 +340,7 @@ bool RasterizerCache<T>::AccelerateDisplayTransfer(const Pica::DisplayTransferCo
 
 template <class T>
 bool RasterizerCache<T>::AccelerateFill(const Pica::MemoryFillConfig& config) {
+    std::scoped_lock cache_lock{cache_mutex};
     const DebugScope scope{runtime, Common::Vec4f{1.f, 0.f, 1.f, 1.f},
                            "RasterizerCache::AccelerateFill ({})", config.DebugName()};
 
@@ -366,17 +370,20 @@ bool RasterizerCache<T>::AccelerateFill(const Pica::MemoryFillConfig& config) {
 
 template <class T>
 typename T::Surface& RasterizerCache<T>::GetSurface(SurfaceId surface_id) {
+    std::scoped_lock cache_lock{cache_mutex};
     return slot_surfaces[surface_id];
 }
 
 template <class T>
 typename T::Sampler& RasterizerCache<T>::GetSampler(SamplerId sampler_id) {
+    std::scoped_lock cache_lock{cache_mutex};
     return slot_samplers[sampler_id];
 }
 
 template <class T>
 typename T::Sampler& RasterizerCache<T>::GetSampler(
     const Pica::TexturingRegs::TextureConfig& config) {
+    std::scoped_lock cache_lock{cache_mutex};
     using TextureFilter = Pica::TexturingRegs::TextureConfig::TextureFilter;
 
     const auto get_filter = [](TextureFilter filter) {
@@ -415,6 +422,7 @@ typename T::Sampler& RasterizerCache<T>::GetSampler(
 template <class T>
 void RasterizerCache<T>::CopySurface(Surface& src_surface, Surface& dst_surface,
                                      SurfaceInterval copy_interval) {
+    std::scoped_lock cache_lock{cache_mutex};
     MICROPROFILE_SCOPE(RasterizerCache_CopySurface);
     const PAddr copy_addr = copy_interval.lower();
     const SurfaceParams subrect_params = dst_surface.FromInterval(copy_interval);
@@ -461,6 +469,7 @@ void RasterizerCache<T>::CopySurface(Surface& src_surface, Surface& dst_surface,
 template <class T>
 SurfaceId RasterizerCache<T>::GetSurface(const SurfaceParams& params, ScaleMatch match_res_scale,
                                          bool load_if_create) {
+    std::scoped_lock cache_lock{cache_mutex};
     if (params.addr == 0 || params.height * params.width == 0) {
         return {};
     }
@@ -486,6 +495,7 @@ SurfaceId RasterizerCache<T>::GetSurface(const SurfaceParams& params, ScaleMatch
 template <class T>
 typename RasterizerCache<T>::SurfaceRect_Tuple RasterizerCache<T>::GetSurfaceSubRect(
     const SurfaceParams& params, ScaleMatch match_res_scale, bool load_if_create) {
+    std::scoped_lock cache_lock{cache_mutex};
     if (params.addr == 0 || params.height * params.width == 0) {
         return std::make_pair(SurfaceId{}, Common::Rectangle<u32>{});
     }
@@ -532,6 +542,7 @@ typename RasterizerCache<T>::SurfaceRect_Tuple RasterizerCache<T>::GetSurfaceSub
 template <class T>
 typename T::Surface& RasterizerCache<T>::GetTextureSurface(
     const Pica::TexturingRegs::FullTextureConfig& config) {
+    std::scoped_lock cache_lock{cache_mutex};
     const auto info = Pica::Texture::TextureInfo::FromPicaRegister(config.config, config.format);
     const u32 max_level = MipLevels(info.width, info.height, config.config.lod.max_level) - 1;
     const SurfaceId surface_id = GetTextureSurface(info, max_level);
@@ -541,6 +552,7 @@ typename T::Surface& RasterizerCache<T>::GetTextureSurface(
 template <class T>
 SurfaceId RasterizerCache<T>::GetTextureSurface(const Pica::Texture::TextureInfo& info,
                                                 u32 max_level) {
+    std::scoped_lock cache_lock{cache_mutex};
     if (info.physical_address == 0) [[unlikely]] {
         // Can occur when texture addr is null or its memory is unmapped/invalid
         // HACK: In this case, the correct behaviour for the PICA is to use the last
@@ -599,6 +611,7 @@ SurfaceId RasterizerCache<T>::GetTextureSurface(const Pica::Texture::TextureInfo
 
 template <class T>
 typename T::Surface& RasterizerCache<T>::GetTextureCube(const TextureCubeConfig& config) {
+    std::scoped_lock cache_lock{cache_mutex};
     if (config.width == 0) [[unlikely]] {
         return slot_surfaces[NULL_SURFACE_CUBE_ID];
     }
@@ -684,6 +697,7 @@ typename T::Surface& RasterizerCache<T>::GetTextureCube(const TextureCubeConfig&
 template <class T>
 FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color_fb,
                                                                 bool using_depth_fb) {
+    std::scoped_lock cache_lock{cache_mutex};
     const auto& config = regs.framebuffer.framebuffer;
 
     const s32 framebuffer_width = config.GetWidth();
@@ -848,6 +862,7 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
 template <class T>
 typename RasterizerCache<T>::SurfaceRect_Tuple RasterizerCache<T>::GetTexCopySurface(
     const SurfaceParams& params) {
+    std::scoped_lock cache_lock{cache_mutex};
     Common::Rectangle<u32> rect{};
 
     SurfaceId match_id = FindMatch<MatchFlags::TexCopy>(params, ScaleMatch::Ignore);
@@ -1284,6 +1299,7 @@ bool RasterizerCache<T>::ValidateByReinterpretation(Surface& surface, SurfacePar
 
 template <class T>
 void RasterizerCache<T>::ClearAll(bool flush) {
+    std::scoped_lock cache_lock{cache_mutex};
     const auto flush_interval = PageMap::interval_type::right_open(0x0, 0xFFFFFFFF);
     // Force flush all surfaces from the cache
     if (flush) {
@@ -1308,6 +1324,7 @@ void RasterizerCache<T>::ClearAll(bool flush) {
 
 template <class T>
 void RasterizerCache<T>::FlushRegion(PAddr addr, u32 size, SurfaceId flush_surface_id) {
+    std::scoped_lock cache_lock{cache_mutex};
     if (size == 0) [[unlikely]] {
         return;
     }
@@ -1355,11 +1372,13 @@ void RasterizerCache<T>::FlushRegion(PAddr addr, u32 size, SurfaceId flush_surfa
 
 template <class T>
 void RasterizerCache<T>::FlushAll() {
+    std::scoped_lock cache_lock{cache_mutex};
     FlushRegion(0, 0xFFFFFFFF);
 }
 
 template <class T>
 void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region_owner_id) {
+    std::scoped_lock cache_lock{cache_mutex};
     if (size == 0) [[unlikely]] {
         return;
     }
