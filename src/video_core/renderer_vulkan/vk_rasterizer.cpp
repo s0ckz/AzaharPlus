@@ -493,18 +493,35 @@ bool RasterizerVulkan::AccelerateDrawBatchInternal(bool is_indexed) {
 void RasterizerVulkan::SetupIndexArray() {
     const bool index_u8 = regs.pipeline.index_array.format == 0;
     const bool native_u8 = index_u8 && instance.IsIndexTypeUint8Supported();
-    const u32 index_buffer_size = regs.pipeline.num_vertices * (native_u8 ? 1 : 2);
+    const u32 num_vertices = regs.pipeline.num_vertices;
+
+    // Defensive: with the GpuWorker offload there's a small chance the
+    // worker observes a transient PICA reg state where num_vertices is
+    // unreasonable, or memory.GetPhysicalPointer returns nullptr. Without
+    // this guard, the memcpy below SIGSEGVs in libc memcpy_aarch64_simd
+    // (tombstone: __memcpy_aarch64_simd+144 → SetupIndexArray+176).
+    if (num_vertices == 0 || num_vertices > 0x400000) [[unlikely]] {
+        return;
+    }
+
+    const u32 index_buffer_size = num_vertices * (native_u8 ? 1 : 2);
     const vk::IndexType index_type = native_u8 ? vk::IndexType::eUint8EXT : vk::IndexType::eUint16;
 
     const u8* index_data =
         memory.GetPhysicalPointer(regs.pipeline.vertex_attributes.GetPhysicalBaseAddress() +
                                   regs.pipeline.index_array.offset);
+    if (index_data == nullptr) [[unlikely]] {
+        return;
+    }
 
     auto [index_ptr, index_offset, _] = stream_buffer.Map(index_buffer_size, 2);
+    if (index_ptr == nullptr) [[unlikely]] {
+        return;
+    }
 
     if (index_u8 && !native_u8) {
         u16* index_ptr_u16 = reinterpret_cast<u16*>(index_ptr);
-        for (u32 i = 0; i < regs.pipeline.num_vertices; i++) {
+        for (u32 i = 0; i < num_vertices; i++) {
             index_ptr_u16[i] = index_data[i];
         }
     } else {
