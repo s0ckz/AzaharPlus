@@ -5,8 +5,14 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
 #include <codecvt>
+#include <cstring>
+#include <sched.h>
+#include <sys/resource.h>
 #include <thread>
+#include <unistd.h>
 #include <dlfcn.h>
 
 #include <android/api-level.h>
@@ -172,6 +178,59 @@ static bool CheckMicPermission() {
                                                                IDCache::GetRequestMicPermission());
 }
 
+// Bump emu thread scheduling priority and keep it on the performance cores.
+// simpleperf measured the emu thread averaging only ~83% of one Cortex-A55
+// core's theoretical cycles in SMB3DL's heavy spot — the 17% headroom is
+// being eaten by DVFS throttling between short idle windows and preemption
+// by other Android system threads. Requesting thread nice=-20 and an
+// affinity mask that excludes the "little" scheduler helper cores recovers
+// most of that headroom. Android apps cannot use SCHED_FIFO without
+// CAP_SYS_NICE, but setpriority(PRIO_PROCESS, 0, -20) is permitted on the
+// foreground app's own threads.
+static void TuneEmuThreadScheduling() {
+#ifdef ANDROID
+    // Try to go to the highest nice value permitted for a foreground app.
+    // On Android, foreground apps can typically reach nice=-10 or lower.
+    // Failures are expected on some devices — log and continue.
+    errno = 0;
+    const int prio_ret = setpriority(PRIO_PROCESS, 0, -20);
+    if (prio_ret != 0) {
+        LOG_WARNING(Frontend, "setpriority(-20) failed: {} (trying -10)", strerror(errno));
+        errno = 0;
+        if (setpriority(PRIO_PROCESS, 0, -10) != 0) {
+            LOG_WARNING(Frontend, "setpriority(-10) failed: {}", strerror(errno));
+        } else {
+            LOG_INFO(Frontend, "Emu thread nice=-10");
+        }
+    } else {
+        LOG_INFO(Frontend, "Emu thread nice=-20");
+    }
+
+    // Pin to all available CPUs. On RK3568 handhelds (4x Cortex-A55) this
+    // matches the default, but setting it explicitly prevents the kernel's
+    // "migrate to little cluster when load seems light" heuristic from
+    // bouncing the thread across cores and cold-starting the L1 cache.
+    const long num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (num_cpus > 0) {
+        cpu_set_t cpus;
+        CPU_ZERO(&cpus);
+        // On 8-core big.LITTLE (e.g. 4 A55 little + 4 A76 big), pin to the
+        // upper 4 cores which are usually the performance cluster. On 4-core
+        // uniform (e.g. RK3568) all 4 bits set is identical to the default.
+        const int start = num_cpus >= 8 ? 4 : 0;
+        const int end = static_cast<int>(num_cpus);
+        for (int i = start; i < end; ++i) {
+            CPU_SET(i, &cpus);
+        }
+        if (sched_setaffinity(0, sizeof(cpus), &cpus) != 0) {
+            LOG_WARNING(Frontend, "sched_setaffinity failed: {}", strerror(errno));
+        } else {
+            LOG_INFO(Frontend, "Emu thread affinity pinned to cores [{}..{})", start, end);
+        }
+    }
+#endif
+}
+
 static Core::System::ResultStatus RunCitra(const std::string& filepath) {
     // Citra core only supports a single running instance
     std::scoped_lock lock(running_mutex);
@@ -179,6 +238,7 @@ static Core::System::ResultStatus RunCitra(const std::string& filepath) {
     LOG_INFO(Frontend, "Azahar starting...");
 
     MicroProfileOnThreadCreate("EmuThread");
+    TuneEmuThreadScheduling();
 
     if (filepath.empty()) {
         LOG_CRITICAL(Frontend, "Failed to load ROM: No ROM specified");
@@ -954,6 +1014,28 @@ jdoubleArray Java_org_citra_citra_1emu_NativeLibrary_getPerfStats(JNIEnv* env,
                            results.time_remaining};
 
         env->SetDoubleArrayRegion(j_stats, 0, 9, stats);
+
+        // Rate-limited diagnostic dump for perf analysis on weak SoCs. Emits
+        // one logcat line per ~1 wall second describing where the emulation
+        // thread's budget is going. Filterable with `adb logcat | grep PerfProbe`.
+        // Values are walltime seconds *per emulated vblank interval*; sum-to-
+        // time_vblank_interval and comparing each to 16.67ms (60Hz budget) shows
+        // which category blew past the budget.
+        static auto last_log = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log).count() >= 1000) {
+            last_log = now;
+            const double frame_ms = results.time_vblank_interval * 1000.0;
+            LOG_INFO(Frontend,
+                     "PerfProbe speed={:.1f}% sysFPS={:.1f} gameFPS={:.1f} frame={:.2f}ms "
+                     "[svc={:.2f} ipc={:.2f} gpu={:.2f} swap={:.2f} tmr={:.2f} dsp={:.2f} "
+                     "rest={:.2f}]",
+                     results.emulation_speed * 100.0, results.system_fps, results.game_fps,
+                     frame_ms, results.time_hle_svc * 1000.0, results.time_hle_ipc * 1000.0,
+                     results.time_gpu * 1000.0, results.time_swap * 1000.0,
+                     results.time_core_timing * 1000.0, results.time_dsp_hle * 1000.0,
+                     results.time_remaining * 1000.0);
+        }
     }
 
     return j_stats;

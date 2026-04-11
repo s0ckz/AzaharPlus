@@ -83,6 +83,14 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         return ResultStatus::ErrorNotInitialized;
     }
 
+    // Deliver any GSP interrupts the GpuWorker deferred since the last
+    // slice. MUST run on the emu thread (Kernel::Event::Signal mutates
+    // Kernel::Thread state). Running it here — before every dynarec
+    // slice — keeps guest interrupt latency in the sub-millisecond range.
+    if (gpu) {
+        gpu->DrainPendingInterrupts();
+    }
+
     if (GDBStub::IsServerEnabled()) {
         Kernel::Thread* thread = kernel->GetCurrentThreadManager().GetCurrentThread();
         if (thread && running_core) {

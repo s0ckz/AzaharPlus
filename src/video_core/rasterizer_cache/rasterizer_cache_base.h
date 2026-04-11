@@ -230,6 +230,39 @@ private:
     Settings::TextureFilter filter;
     bool dump_textures;
     bool use_custom_textures;
+
+    // Per-draw framebuffer-lookup memoization. SMB3DL issues ~100 DrawArrays
+    // per frame; many consecutive draws use the IDENTICAL framebuffer config
+    // (same color/depth surfaces, same viewport). The original
+    // GetFramebufferSurfaces re-runs GetSurfaceSubRect (which iterates
+    // boost::icl interval maps) on every call. Cache the LOOKUP RESULT keyed
+    // on the relevant register state — if the key matches, skip the
+    // expensive surface lookup and reuse the cached SurfaceIds + rects.
+    //
+    // The cache is invalidated whenever a surface is registered/unregistered
+    // (the cached SurfaceIds might point at freed slots). Invalidating
+    // dirty_regions / cached_pages does NOT need to invalidate this cache
+    // because the SurfaceIds remain valid.
+    struct CachedFbLookup {
+        bool valid{false};
+        // Key
+        PAddr color_addr{};
+        PAddr depth_addr{};
+        u32 width{};
+        u32 height{};
+        u32 color_format{};
+        u32 depth_format{};
+        Common::Rectangle<s32> viewport{};
+        bool shadow_rendering{};
+        bool using_color{};
+        bool using_depth{};
+        // Result
+        SurfaceId color_id{};
+        SurfaceId depth_id{};
+        Common::Rectangle<u32> color_rect{};
+        Common::Rectangle<u32> depth_rect{};
+    };
+    CachedFbLookup last_fb_lookup{};
 };
 
 } // namespace VideoCore

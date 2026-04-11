@@ -30,26 +30,6 @@ void ShaderSetup::WriteUniformIntReg(u32 index, const Common::Vec4<u8> values) {
     uniforms_dirty |= prev != values;
 }
 
-std::optional<u32> ShaderSetup::WriteUniformFloatReg(ShaderRegs& config, u32 value) {
-    auto& uniform_setup = config.uniform_setup;
-    const bool is_float32 = uniform_setup.IsFloat32();
-    if (!uniform_queue.Push(value, is_float32)) {
-        return std::nullopt;
-    }
-
-    const auto uniform = uniform_queue.Get(is_float32);
-    if (uniform_setup.index >= uniforms.f.size()) {
-        LOG_ERROR(HW_GPU, "Invalid float uniform index {}", uniform_setup.index.Value());
-        return std::nullopt;
-    }
-
-    const u32 index = uniform_setup.index.Value();
-    const auto prev = std::exchange(uniforms.f[index], uniform);
-    uniforms_dirty |= prev != uniform;
-    uniform_setup.index.Assign(index + 1);
-    return index;
-}
-
 u64 ShaderSetup::GetProgramCodeHash() {
     if (program_code_hash_dirty) {
         const auto& prog_code = GetProgramCode();

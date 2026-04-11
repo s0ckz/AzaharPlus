@@ -65,7 +65,18 @@ public:
         // Walltime in seconds of the vblank interval spent in Renderer::SwapBuffers (includes
         // waiting for host GPU to finish)
         double time_swap;
-        // Walltime in seconds of the vblank interval spent in other operations
+        // Walltime in seconds of the vblank interval spent in the DSP HLE audio tick running on
+        // the emu thread. Subtracted out of time_remaining so the remainder reflects dynarec +
+        // uninstrumented work only. Nested inside time_core_timing (DSP HLE runs via a core-timing
+        // callback), so time_core_timing is reported EXCLUSIVE of time_dsp_hle.
+        double time_dsp_hle;
+        // Walltime in seconds of the vblank interval spent in Timing::Timer::Advance (core-timing
+        // event dispatch loop) EXCLUDING time spent inside the nested DSP HLE tick. Separates
+        // "the JIT is slow" from "the core-timing scheduler is flapping too often".
+        double time_core_timing;
+        // Walltime in seconds of the vblank interval spent in other operations. After subtracting
+        // svc / swap / core_timing buckets this is effectively the cost of dynarec JIT execution
+        // plus any uninstrumented work on the emu thread.
         double time_remaining;
         /// Ratio of walltime / emulated time elapsed
         double emulation_speed;
@@ -83,6 +94,10 @@ public:
     void EndGPUProcessing();
     void StartSwap();
     void EndSwap();
+    void BeginDSPProcessing();
+    void EndDSPProcessing();
+    void BeginCoreTimingProcessing();
+    void EndCoreTimingProcessing();
     void BeginSystemFrame();
     void EndSystemFrame();
     void EndGameFrame();
@@ -170,6 +185,12 @@ private:
 
     Clock::time_point start_swap_time = reset_point;
     Clock::duration accumulated_swap_time = Clock::duration::zero();
+
+    Clock::time_point start_dsp_time = reset_point;
+    Clock::duration accumulated_dsp_time = Clock::duration::zero();
+
+    Clock::time_point start_core_timing_time = reset_point;
+    Clock::duration accumulated_core_timing_time = Clock::duration::zero();
 
     /// Last recorded performance statistics.
     Results last_stats;

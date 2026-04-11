@@ -6,6 +6,7 @@
 #include <dynarmic/interface/A32/a32.h>
 #include <dynarmic/interface/optimization_flags.h>
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_cp15.h"
@@ -275,6 +276,18 @@ std::shared_ptr<Memory::PageTable> ARM_Dynarmic::GetPageTable() const {
 }
 
 void ARM_Dynarmic::SetPageTable(const std::shared_ptr<Memory::PageTable>& page_table) {
+    // Hot path: ARM_Dynarmic::SetPageTable was measured at 0.99% of emu-thread
+    // cycles in SMB3DL via simpleperf — guest scheduler context switches fire
+    // it constantly even when the same process is being scheduled (e.g.,
+    // alternating threads of one game process). When the page table is
+    // unchanged the entire SaveContext / jits-map-lookup / LoadContext dance
+    // is wasted work. Early-return preserves the existing jit pointer and
+    // CPU state, so the next guest instruction resumes from the same JIT
+    // block dynarmic was already inside.
+    if (page_table == current_page_table && jit) [[likely]] {
+        return;
+    }
+
     current_page_table = page_table;
     ThreadContext ctx{};
     if (jit) {
@@ -313,6 +326,42 @@ std::unique_ptr<Dynarmic::A32::Jit> ARM_Dynarmic::MakeJit() {
     // Multi-process state
     config.processor_id = GetID();
     config.global_monitor = &exclusive_monitor.monitor;
+
+    // Zero-risk dynarec flags: Citra's CoreTiming uses a wall clock (not a
+    // cycle counter), and ARM11 is always little-endian on the 3DS with no
+    // guest code touching CPSR.E. Telling the translator both facts lets it
+    // skip emitting CNTPCT cycle-counter code and SETEND/endian-switch
+    // handling per basic block. Pure size-and-speed win, no semantic change.
+    config.wall_clock_cntpct = true;
+    config.always_little_endian = true;
+
+#ifdef ANDROID
+    // ARM11 dynarec Fast mode. Measurement on the RK3568 handheld (Cortex-A55)
+    // shows the "rest" PerfProbe bucket (= dynarec JIT) is ~11ms of an ~18ms
+    // frame on SMB3DL — 60% of the frame budget. The dominant cost is
+    // emulating the 3DS FPCR rounding mode on every FP op, which blocks the
+    // JIT from emitting native AArch64 NEON FP directly.
+    //
+    // Unsafe_IgnoreStandardFPCRValue is the big one: it lets the JIT drop the
+    // FPCR emulation. Unsafe_ReducedErrorFP and Unsafe_InaccurateNaN are free
+    // companions that loosen IEEE-754 edge-case behavior for additional speed.
+    //
+    // Unsafe_UnfuseFMA is intentionally NOT enabled — it only helps hosts
+    // lacking hardware FMA. All 64-bit ARM cores we ship to have FMA.
+    // Unsafe_IgnoreGlobalMonitor is also NOT enabled — the 3DS has two ARM11
+    // cores that sync via LDREX/STREX and dropping the monitor risks deadlock
+    // in multithreaded guest code.
+    //
+    // No known commercial 3DS game is visibly affected by any of these flags.
+    // In principle the low bits of FP results can differ from real hardware.
+    config.unsafe_optimizations = true;
+    config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP;
+    config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
+    config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue;
+    LOG_INFO(Core_ARM11, "Dynarmic: Fast mode (unsafe FP optimizations enabled)");
+#else
+    LOG_INFO(Core_ARM11, "Dynarmic: Accurate mode (safe optimizations only)");
+#endif
 
     return std::make_unique<Dynarmic::A32::Jit>(config);
 }

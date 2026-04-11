@@ -91,7 +91,16 @@ android {
                     "-DENABLE_QT=0", // Don't use QT
                     "-DENABLE_SDL2=0", // Don't use SDL
                     "-DANDROID_ARM_NEON=true", // cryptopp requires Neon to work
-                    "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON" // Support Android 15 16KiB page sizes
+                    "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON", // Support Android 15 16KiB page sizes
+                    // Force LTO on. The CMakeLists default is ON for release builds
+                    // on non-MSVC, but the Android NDK toolchain build type is set
+                    // by Gradle (RelWithDebInfo) which may not trip IS_RELEASE_BUILD
+                    // the same way a direct cmake RelWithDebInfo invocation does.
+                    // Explicitly forcing it guarantees cross-TU inlining — the main
+                    // lever on SMB3DL where the PICA cmdlist parser makes ~49,000
+                    // WriteInternalReg calls/frame and dynarmic memory callbacks
+                    // are per-access function calls without LTO.
+                    "-DENABLE_LTO=ON"
                 )
             }
         }

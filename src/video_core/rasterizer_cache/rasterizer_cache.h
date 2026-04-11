@@ -696,35 +696,105 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
         static_cast<u32>(std::clamp(viewport_rect.bottom, 0, framebuffer_height)),
     };
 
-    SurfaceParams color_params;
-    color_params.is_tiled = true;
-    color_params.res_scale = resolution_scale_factor;
-    color_params.width = config.GetWidth();
-    color_params.height = config.GetHeight();
-    SurfaceParams depth_params = color_params;
-
-    color_params.addr = config.GetColorBufferPhysicalAddress();
-    color_params.pixel_format = PixelFormatFromColorFormat(config.color_format);
-    color_params.UpdateParams();
-
-    depth_params.addr = config.GetDepthBufferPhysicalAddress();
-    depth_params.pixel_format = PixelFormatFromDepthFormat(config.depth_format);
-    depth_params.UpdateParams();
-
-    auto color_vp_interval = color_params.GetSubRectInterval(viewport_clamped);
-    auto depth_vp_interval = depth_params.GetSubRectInterval(viewport_clamped);
+    // Hot-path memoization: SMB3DL submits ~100 DrawArrays per frame and
+    // most consecutive draws share the same framebuffer config. The
+    // GetSurfaceSubRect / FindMatch / ForEachSurfaceInRegion chain
+    // (boost::icl interval map iteration) showed up at ~22% of Draw call
+    // children in simpleperf — caching the result across same-config draws
+    // is a free win. The cache is invalidated whenever a surface is
+    // registered or unregistered (which would change the lookup result).
+    const PAddr color_addr_q = config.GetColorBufferPhysicalAddress();
+    const PAddr depth_addr_q = config.GetDepthBufferPhysicalAddress();
+    const u32 color_fmt_q = static_cast<u32>(config.color_format.Value());
+    const u32 depth_fmt_q = static_cast<u32>(config.depth_format.Value());
+    const u32 width_q = static_cast<u32>(framebuffer_width);
+    const u32 height_q = static_cast<u32>(framebuffer_height);
+    const bool shadow_q = regs.framebuffer.IsShadowRendering();
 
     Common::Rectangle<u32> color_rect{};
     SurfaceId color_id{};
     u32 color_level{};
-    if (using_color_fb)
-        std::tie(color_id, color_rect) = GetSurfaceSubRect(color_params, ScaleMatch::Exact, false);
-
     Common::Rectangle<u32> depth_rect{};
     SurfaceId depth_id{};
     u32 depth_level{};
-    if (using_depth_fb)
-        std::tie(depth_id, depth_rect) = GetSurfaceSubRect(depth_params, ScaleMatch::Exact, false);
+
+    const bool fb_cache_hit = last_fb_lookup.valid &&
+                              last_fb_lookup.color_addr == color_addr_q &&
+                              last_fb_lookup.depth_addr == depth_addr_q &&
+                              last_fb_lookup.width == width_q &&
+                              last_fb_lookup.height == height_q &&
+                              last_fb_lookup.color_format == color_fmt_q &&
+                              last_fb_lookup.depth_format == depth_fmt_q &&
+                              last_fb_lookup.viewport == viewport_rect &&
+                              last_fb_lookup.shadow_rendering == shadow_q &&
+                              last_fb_lookup.using_color == using_color_fb &&
+                              last_fb_lookup.using_depth == using_depth_fb;
+
+    SurfaceParams color_params;
+    SurfaceParams depth_params;
+
+    if (fb_cache_hit) {
+        // Reuse cached lookup result. We still need color/depth_params for
+        // the ValidateSurface call below (it uses GetSubRectInterval), so
+        // construct them from the same inputs as the original path.
+        color_params.is_tiled = true;
+        color_params.res_scale = resolution_scale_factor;
+        color_params.width = width_q;
+        color_params.height = height_q;
+        depth_params = color_params;
+        color_params.addr = color_addr_q;
+        color_params.pixel_format = PixelFormatFromColorFormat(config.color_format);
+        color_params.UpdateParams();
+        depth_params.addr = depth_addr_q;
+        depth_params.pixel_format = PixelFormatFromDepthFormat(config.depth_format);
+        depth_params.UpdateParams();
+        color_id = last_fb_lookup.color_id;
+        depth_id = last_fb_lookup.depth_id;
+        color_rect = last_fb_lookup.color_rect;
+        depth_rect = last_fb_lookup.depth_rect;
+    } else {
+        color_params.is_tiled = true;
+        color_params.res_scale = resolution_scale_factor;
+        color_params.width = width_q;
+        color_params.height = height_q;
+        depth_params = color_params;
+
+        color_params.addr = color_addr_q;
+        color_params.pixel_format = PixelFormatFromColorFormat(config.color_format);
+        color_params.UpdateParams();
+
+        depth_params.addr = depth_addr_q;
+        depth_params.pixel_format = PixelFormatFromDepthFormat(config.depth_format);
+        depth_params.UpdateParams();
+
+        if (using_color_fb)
+            std::tie(color_id, color_rect) =
+                GetSurfaceSubRect(color_params, ScaleMatch::Exact, false);
+
+        if (using_depth_fb)
+            std::tie(depth_id, depth_rect) =
+                GetSurfaceSubRect(depth_params, ScaleMatch::Exact, false);
+
+        // Update cache with new lookup.
+        last_fb_lookup.valid = true;
+        last_fb_lookup.color_addr = color_addr_q;
+        last_fb_lookup.depth_addr = depth_addr_q;
+        last_fb_lookup.width = width_q;
+        last_fb_lookup.height = height_q;
+        last_fb_lookup.color_format = color_fmt_q;
+        last_fb_lookup.depth_format = depth_fmt_q;
+        last_fb_lookup.viewport = viewport_rect;
+        last_fb_lookup.shadow_rendering = shadow_q;
+        last_fb_lookup.using_color = using_color_fb;
+        last_fb_lookup.using_depth = using_depth_fb;
+        last_fb_lookup.color_id = color_id;
+        last_fb_lookup.depth_id = depth_id;
+        last_fb_lookup.color_rect = color_rect;
+        last_fb_lookup.depth_rect = depth_rect;
+    }
+
+    auto color_vp_interval = color_params.GetSubRectInterval(viewport_clamped);
+    auto depth_vp_interval = depth_params.GetSubRectInterval(viewport_clamped);
 
     Common::Rectangle<u32> fb_rect{};
     if (color_id && depth_id) {
@@ -1366,6 +1436,13 @@ void RasterizerCache<T>::RegisterSurface(SurfaceId surface_id) {
     UpdatePagesCachedCount(surface.addr, surface.size, 1);
     ForEachPage(surface.addr, surface.size,
                 [this, surface_id](u64 page) { page_table[page].push_back(surface_id); });
+    // NOTE: we deliberately do NOT invalidate last_fb_lookup here. A newly
+    // created surface never invalidates our cached color/depth IDs — those
+    // still point at valid registered surfaces. Invalidating on every
+    // RegisterSurface would cause the cache to miss frequently (surfaces
+    // are created for many things beyond framebuffers, e.g. texture loads).
+    // The cache is only invalidated in UnregisterSurface where the cached
+    // IDs could actually become stale.
 }
 
 template <class T>
@@ -1373,6 +1450,10 @@ void RasterizerCache<T>::UnregisterSurface(SurfaceId surface_id) {
     Surface& surface = slot_surfaces[surface_id];
     ASSERT_MSG(True(surface.flags & SurfaceFlagBits::Registered),
                "Trying to unregister an already unregistered surface");
+
+    // Surface set changed → cached framebuffer lookup may point at the
+    // surface we're about to free. Invalidate before any other work.
+    last_fb_lookup.valid = false;
 
     surface.flags &= ~SurfaceFlagBits::Registered;
     UpdatePagesCachedCount(surface.addr, surface.size, -1);

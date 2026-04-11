@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include "common/common_types.h"
 #include "core/hle/service/gsp/gsp_interrupt.h"
 #include "video_core/pica/dirty_regs.h"
@@ -26,6 +27,29 @@ class RasterizerInterface;
 
 namespace Pica {
 
+// Diagnostic probe to decompose PicaCore::ProcessCmdList into its internal
+// sub-phases. The 1Hz log dump in GPU::VBlankCallback reads these via
+// GetCmdListProbe() / ResetCmdListProbe(). No locking: all updates happen on
+// the GSP service thread under the same implicit serialization perf_stats
+// relies on, and the reset races with the next cmdlist batch at most once
+// per log interval, which only skews 1 line of output.
+struct CmdListProbe {
+    // Total wall-ns across all ProcessCmdList() invocations (the same wall
+    // time that the outer GpuExecProbe `cmdlist` bucket reports).
+    std::uint64_t cmdlists_n = 0;
+    std::uint64_t cmdlists_ns = 0;
+    // Wall-ns spent inside DrawArrays() triggers (a sub-bucket of cmdlists_ns).
+    // If this dominates, the cost is in rasterizer state upload and geometry
+    // pipeline dispatch — NOT the register-walking loop.
+    std::uint64_t draws_n = 0;
+    std::uint64_t draws_ns = 0;
+    // Number of WriteInternalReg() invocations across all cmdlists. Divide
+    // cmdlists_ns-draws_ns by this to get per-regwrite cost in ns.
+    std::uint64_t regwrites_n = 0;
+};
+CmdListProbe GetCmdListProbe();
+void ResetCmdListProbe();
+
 class DebugContext;
 class ShaderEngine;
 
@@ -43,7 +67,12 @@ public:
 private:
     void InitializeRegs();
 
-    void WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requested);
+    // Slow path for side-effect-triggering register writes. Only called by
+    // ProcessCmdList's hot loop when the register ID is set in the compile-
+    // time action bitset. The read-modify-write on reg_array and the dirty
+    // bit are already applied by the caller BEFORE this runs, so the switch
+    // inside only handles side effects.
+    void WriteInternalRegAction(u32 id, u32 value, u32 mask, bool& stop_requested);
 
     void SubmitImmediate(u32 data);
 

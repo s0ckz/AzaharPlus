@@ -516,7 +516,14 @@ struct Values {
     Setting<bool> dump_command_buffers{false, Keys::dump_command_buffers};
     SwitchableSetting<bool> spirv_shader_gen{true, Keys::spirv_shader_gen};
     SwitchableSetting<bool> disable_spirv_optimizer{true, Keys::disable_spirv_optimizer};
+    // Compile Vulkan shaders on worker threads rather than blocking the game
+    // thread on first encounter. Eliminates multi-frame stalls in SMB3DL when
+    // entering new worlds and hitting fresh shader variants.
+#ifdef ANDROID
+    SwitchableSetting<bool> async_shader_compilation{true, Keys::async_shader_compilation};
+#else
     SwitchableSetting<bool> async_shader_compilation{false, Keys::async_shader_compilation};
+#endif
     SwitchableSetting<bool> async_presentation{true, Keys::async_presentation};
     SwitchableSetting<bool> use_hw_shader{true, Keys::use_hw_shader};
     SwitchableSetting<bool> use_disk_shader_cache{true, Keys::use_disk_shader_cache};
@@ -616,7 +623,19 @@ struct Values {
     // Audio
     bool audio_muted;
     SwitchableSetting<AudioEmulation> audio_emulation{AudioEmulation::HLE, Keys::audio_emulation};
+    // SoundTouch audio time-stretcher. Designed for desktop-style real-time
+    // pitch/tempo correction under slight speed variance. On weak mobile SoCs
+    // it creates a POSITIVE FEEDBACK LOOP: when emulation drops below 100%
+    // speed, the stretcher kicks in to cover the gap, but the stretcher
+    // itself is expensive (per-frame DSP cost measured at 0.7–1.4ms/vblank
+    // on Cortex-A55 in SMB3DL heavy scenes), which makes emulation even
+    // slower, which makes the stretcher work harder. Default to off on
+    // Android to break the loop.
+#ifdef ANDROID
+    SwitchableSetting<bool> enable_audio_stretching{false, Keys::enable_audio_stretching};
+#else
     SwitchableSetting<bool> enable_audio_stretching{true, Keys::enable_audio_stretching};
+#endif
     SwitchableSetting<bool> enable_realtime_audio{false, Keys::enable_realtime_audio};
     SwitchableSetting<float, true> volume{1.f, 0.f, 1.f, Keys::volume};
     Setting<AudioCore::SinkType> output_type{AudioCore::SinkType::Auto, Keys::output_type};

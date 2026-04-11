@@ -13,6 +13,8 @@ add_library(video_core STATIC
     gpu.h
     gpu_debugger.h
     gpu_impl.h
+    gpu_worker.cpp
+    gpu_worker.h
     pica_types.h
     precompiled_headers.h
     rasterizer_accelerated.cpp

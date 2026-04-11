@@ -2,8 +2,11 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <chrono>
+#include <cstdint>
 #include "common/archives.h"
 #include "common/hacks/hack_manager.h"
+#include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -29,6 +32,20 @@ constexpr VAddr VADDR_GPU = 0x1EF00000;
 MICROPROFILE_DEFINE(GPU_DisplayTransfer, "GPU", "DisplayTransfer", MP_RGB(100, 100, 255));
 MICROPROFILE_DEFINE(GPU_CmdlistProcessing, "GPU", "Cmdlist Processing", MP_RGB(100, 255, 100));
 
+// Worker-side diagnostic counters. Incremented by the *OnWorker methods
+// and logged from VBlankOnWorker at 1 Hz. File-scope (not in anonymous
+// namespace) so they're reachable from every function in this TU
+// without ordering constraints.
+namespace {
+std::atomic<std::uint64_t> g_worker_exec_submit{0};
+std::atomic<std::uint64_t> g_worker_exec_dma{0};
+std::atomic<std::uint64_t> g_worker_exec_fill{0};
+std::atomic<std::uint64_t> g_worker_exec_xfer{0};
+std::atomic<std::uint64_t> g_worker_exec_other{0};
+std::atomic<std::uint64_t> g_worker_setbufferswap{0};
+std::atomic<std::uint64_t> g_worker_vblank{0};
+} // namespace
+
 GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
          Frontend::EmuWindow* secondary_window)
     : right_eye_disabler{std::make_unique<RightEyeDisabler>(*this)},
@@ -40,9 +57,27 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
 
     // Bind the rasterizer to the PICA GPU
     impl->pica.BindRasterizer(impl->rasterizer);
+
+    // Start the GPU worker thread. From this point on, ALL mutation of
+    // PICA state, the rasterizer cache, and the Vulkan scheduler must
+    // happen on the worker thread via messages pushed through Impl::worker.
+    impl->worker.Start(this);
 }
 
-GPU::~GPU() = default;
+GPU::~GPU() {
+    // Stop the worker BEFORE the impl unique_ptr destructor runs. libc++'s
+    // std::unique_ptr::reset sets its stored pointer to nullptr *before*
+    // invoking the deleter, so there is a window between the null store
+    // and Impl::~Impl's worker.Stop() where the worker thread reads
+    // this->impl as null and SIGSEGVs at the offset of whatever Impl
+    // member it was about to touch.
+    if (impl) {
+        impl->worker.Stop();
+        if (impl->vblank_event) {
+            impl->timing.UnscheduleEvent(impl->vblank_event, 0);
+        }
+    }
+}
 
 PAddr GPU::VirtualToPhysicalAddress(VAddr addr) {
     if (addr == 0) {
@@ -69,8 +104,77 @@ PAddr GPU::VirtualToPhysicalAddress(VAddr addr) {
 }
 
 void GPU::SetInterruptHandler(Service::GSP::InterruptHandler handler) {
-    impl->signal_interrupt = handler;
-    impl->pica.SetInterruptHandler(handler);
+    // Store the real handler, then install a thin wrapper that routes
+    // interrupt delivery away from the worker thread. Kernel::Event::
+    // Signal (inside the GSP handler) mutates Kernel::Thread state and
+    // races with the emu thread running ThreadManager::SwitchContext
+    // → SIGTRAP. The wrapper defers worker-thread signals into
+    // impl->pending_interrupts; the emu thread drains them from
+    // System::RunLoop (every dynarec slice).
+    impl->real_signal_interrupt = handler;
+    impl->signal_interrupt = [this](Service::GSP::InterruptId id) {
+        if (GpuWorker::IsOnWorkerThread()) {
+            std::scoped_lock lock{impl->pending_interrupts_mutex};
+            impl->pending_interrupts.push_back(id);
+            return;
+        }
+        if (impl->real_signal_interrupt) {
+            impl->real_signal_interrupt(id);
+        }
+    };
+    impl->pica.SetInterruptHandler(impl->signal_interrupt);
+}
+
+void GPU::DrainPendingInterrupts() {
+    // Called from the emu thread only. Swap the pending list under the
+    // lock to keep the critical section tiny, then fire each interrupt
+    // outside the lock (Kernel::Event::Signal may wake threads and
+    // reschedule — non-trivial work that shouldn't hold the mutex).
+    std::vector<Service::GSP::InterruptId> drained;
+    {
+        std::scoped_lock lock{impl->pending_interrupts_mutex};
+        if (impl->pending_interrupts.empty()) {
+            return;
+        }
+        drained.swap(impl->pending_interrupts);
+    }
+    if (!impl->real_signal_interrupt) {
+        return;
+    }
+
+    // 1 Hz diagnostic: drain counts per-interrupt-type. Helps diagnose
+    // whether the worker is firing interrupts (counts > 0 but game
+    // stalls = guest not using those interrupts) or not (counts = 0 =
+    // worker stuck or not firing).
+    static std::atomic<std::uint64_t> drained_pdc0{0};
+    static std::atomic<std::uint64_t> drained_pdc1{0};
+    static std::atomic<std::uint64_t> drained_p3d{0};
+    static std::atomic<std::uint64_t> drained_psc{0};
+    static std::atomic<std::uint64_t> drained_ppf{0};
+    static std::atomic<std::uint64_t> drained_dma{0};
+    for (const auto id : drained) {
+        switch (id) {
+        case Service::GSP::InterruptId::PDC0: drained_pdc0++; break;
+        case Service::GSP::InterruptId::PDC1: drained_pdc1++; break;
+        case Service::GSP::InterruptId::P3D:  drained_p3d++;  break;
+        case Service::GSP::InterruptId::PSC0:
+        case Service::GSP::InterruptId::PSC1: drained_psc++;  break;
+        case Service::GSP::InterruptId::PPF:  drained_ppf++;  break;
+        case Service::GSP::InterruptId::DMA:  drained_dma++;  break;
+        default: break;
+        }
+        impl->real_signal_interrupt(id);
+    }
+    static auto last_log = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log).count() >= 1000) {
+        last_log = now;
+        LOG_INFO(HW_GPU,
+                 "GpuIntrProbe pdc0={} pdc1={} p3d={} psc={} ppf={} dma={}",
+                 drained_pdc0.exchange(0), drained_pdc1.exchange(0),
+                 drained_p3d.exchange(0), drained_psc.exchange(0),
+                 drained_ppf.exchange(0), drained_dma.exchange(0));
+    }
 }
 
 void GPU::FlushRegion(PAddr addr, u32 size) {
@@ -86,8 +190,45 @@ void GPU::ClearAll(bool flush) {
 }
 
 void GPU::Execute(const Service::GSP::Command& command) {
+    // Producer path on the emu thread: push the command to the worker
+    // queue and return immediately. On re-entry from the worker itself
+    // (via SignalInterruptForThread → GPU::SetBufferSwap etc.) fall
+    // through to the synchronous body to avoid self-deadlock on a full
+    // queue.
+    if (impl->worker.IsRunning() && !GpuWorker::IsOnWorkerThread()) [[likely]] {
+        // Drain any worker-fired interrupts BEFORE the guest thread
+        // observes the result of this SVC. The guest thread is running
+        // in emu-thread context right now and will only see kernel state
+        // updates performed on the emu thread.
+        DrainPendingInterrupts();
+        impl->worker.Push(GpuCmdExecute{command});
+        return;
+    }
+    ExecuteOnWorker(command);
+}
+
+void GPU::ExecuteOnWorker(const Service::GSP::Command& command) {
     using Service::GSP::CommandId;
     auto& regs = impl->pica.regs;
+
+    switch (command.id) {
+    case CommandId::SubmitCmdList:
+        g_worker_exec_submit.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case CommandId::RequestDma:
+        g_worker_exec_dma.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case CommandId::MemoryFill:
+        g_worker_exec_fill.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case CommandId::DisplayTransfer:
+    case CommandId::TextureCopy:
+        g_worker_exec_xfer.fetch_add(1, std::memory_order_relaxed);
+        break;
+    default:
+        g_worker_exec_other.fetch_add(1, std::memory_order_relaxed);
+        break;
+    }
 
     switch (command.id) {
     case CommandId::RequestDma: {
@@ -190,6 +331,20 @@ void GPU::Execute(const Service::GSP::Command& command) {
 }
 
 void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info) {
+    // Keep SetBufferSwap synchronous on the emu thread. This is on the
+    // interrupt-delivery path (SignalInterruptForThread → SetBufferSwap)
+    // where ordering with PDC interrupt firing matters. Flush any
+    // pending worker draws first so framebuffer_config isn't written
+    // out of order with a prior cmdlist.
+    if (impl->worker.IsRunning() && !GpuWorker::IsOnWorkerThread()) {
+        impl->worker.Flush();
+    }
+    SetBufferSwapOnWorker(screen_id, info);
+}
+
+void GPU::SetBufferSwapOnWorker(u32 screen_id, const Service::GSP::FrameBufferInfo& info) {
+    g_worker_setbufferswap.fetch_add(1, std::memory_order_relaxed);
+
     const PAddr phys_address_left = VirtualToPhysicalAddress(info.address_left);
     const PAddr phys_address_right = VirtualToPhysicalAddress(info.address_right);
 
@@ -220,11 +375,27 @@ void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info
 }
 
 void GPU::SetColorFill(const Pica::ColorFill& fill) {
+    if (impl->worker.IsRunning() && !GpuWorker::IsOnWorkerThread()) {
+        impl->worker.Flush();
+    }
+    SetColorFillOnWorker(fill.raw);
+}
+
+void GPU::SetColorFillOnWorker(u32 raw) {
+    Pica::ColorFill fill{};
+    fill.raw = raw;
     impl->pica.regs_lcd.color_fill_top = fill;
     impl->pica.regs_lcd.color_fill_bottom = fill;
 }
 
 u32 GPU::ReadReg(VAddr addr) {
+    // Guest MMIO reads of PICA registers MUST observe all prior worker
+    // writes for read-after-write correctness. Flush the worker before
+    // reading. This is rare for commercial 3DS titles (SMB3DL sees zero
+    // MMIO reads during gameplay) so the Flush overhead is acceptable.
+    if (impl->worker.IsRunning() && !GpuWorker::IsOnWorkerThread()) {
+        impl->worker.Flush();
+    }
     switch (addr & 0xFFFFF000) {
     case VADDR_LCD: {
         const u32 offset = addr - VADDR_LCD;
@@ -247,6 +418,20 @@ u32 GPU::ReadReg(VAddr addr) {
 }
 
 void GPU::WriteReg(VAddr addr, u32 data) {
+    // Track guest MMIO writes. SMB3DL HOME menu hits ~68/s briefly
+    // during LLE applet init; actual gameplay is zero. Logged 1 Hz from
+    // VBlankOnWorker.
+    impl->mmio_writereg_count.fetch_add(1, std::memory_order_relaxed);
+
+    // MMIO writes MUST maintain read-after-write ordering with subsequent
+    // ReadRegs AND with worker register writes. Flush the worker first
+    // to quiesce it, then apply the write synchronously on the emu
+    // thread. This also serializes the trigger-register side effects
+    // (MemoryFill/Transfer/SubmitCmdList) with any worker draws.
+    if (impl->worker.IsRunning() && !GpuWorker::IsOnWorkerThread()) {
+        impl->worker.Flush();
+    }
+
     switch (addr & 0xFFFFF000) {
     case VADDR_LCD: {
         const u32 offset = addr - VADDR_LCD;
@@ -265,7 +450,9 @@ void GPU::WriteReg(VAddr addr, u32 data) {
         ASSERT(index < Pica::PicaCore::Regs::NUM_REGS);
         impl->pica.regs.reg_array[index] = data;
 
-        // Handle registers that trigger GPU actions
+        // Handle registers that trigger GPU actions. Running these on
+        // the emu thread (after Flush) is safe because the worker has
+        // been drained and won't touch the rasterizer concurrently.
         switch (index) {
         case GPU_REG_INDEX(memory_fill_config[0].trigger):
             MemoryFill(0, 0);
@@ -411,18 +598,57 @@ void GPU::MemoryTransfer() {
 }
 
 void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
-    // Present renderered frame.
+    // Core timing event dispatch runs on the emu thread. We keep the
+    // VBlank/SwapBuffers path SYNCHRONOUS here — routing it through the
+    // worker appeared to break guest boot (the guest advanced through
+    // DSP init quickly but then stalled with no GSP calls). The guest's
+    // PDC interrupt handler and VBlank timing expect PDC0/PDC1 to fire
+    // inline with the core_timing event, not asynchronously. Before
+    // calling the synchronous body we flush the worker to establish
+    // read-after-write ordering — the guest's dynarec will read GSP
+    // shared memory state (framebuffer_config, etc.) that any queued
+    // worker draw might still be about to mutate.
+    if (impl->worker.IsRunning() && !GpuWorker::IsOnWorkerThread()) {
+        impl->worker.Flush();
+    }
+    VBlankOnWorker(cycles_late);
+    impl->timing.ScheduleEvent(FRAME_TICKS - cycles_late, impl->vblank_event);
+}
+
+void GPU::VBlankOnWorker(s64 cycles_late) {
+    g_worker_vblank.fetch_add(1, std::memory_order_relaxed);
+
+    // Present rendered frame.
     impl->renderer->SwapBuffers();
 
     // Signal to GSP that GPU interrupt has occurred
     impl->signal_interrupt(Service::GSP::InterruptId::PDC0);
     impl->signal_interrupt(Service::GSP::InterruptId::PDC1);
 
-    // Reschedule recurrent event
-    impl->timing.ScheduleEvent(FRAME_TICKS - cycles_late, impl->vblank_event);
+    // 1 Hz diagnostic sample.
+    static auto last_log = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log).count() >= 1000) {
+        last_log = now;
+        const auto mmio_count = impl->mmio_writereg_count.exchange(0, std::memory_order_relaxed);
+        LOG_INFO(HW_GPU,
+                 "GpuWorkerProbe vblank={}/s submit={} dma={} fill={} xfer={} other={} "
+                 "setbufswap={} mmio={}",
+                 g_worker_vblank.exchange(0),
+                 g_worker_exec_submit.exchange(0),
+                 g_worker_exec_dma.exchange(0),
+                 g_worker_exec_fill.exchange(0),
+                 g_worker_exec_xfer.exchange(0),
+                 g_worker_exec_other.exchange(0),
+                 g_worker_setbufferswap.exchange(0),
+                 mmio_count);
+    }
 }
 
 void GPU::RecreateRenderer(Frontend::EmuWindow& emu_window, Frontend::EmuWindow* secondary_window) {
+    // Stop the worker so we can destroy the renderer without racing it.
+    impl->worker.Stop();
+
     // Reset the renderer (this will destroy OpenGL resources)
     impl->renderer.reset();
 
@@ -459,9 +685,14 @@ void GPU::RecreateRenderer(Frontend::EmuWindow& emu_window, Frontend::EmuWindow*
     impl->pica.lighting.lut_dirty = impl->pica.lighting.LutAllDirty;
     impl->pica.fog.lut_dirty = true;
     impl->pica.proctex.table_dirty = impl->pica.proctex.TableAllDirty;
+
+    // Restart the worker for the new renderer.
+    impl->worker.Start(this);
 }
 
 void GPU::ReleaseRenderer() {
+    impl->worker.Stop();
+
     // Just reset the renderer to release OpenGL resources
     // Don't null out rasterizer pointer as it will become dangling
     impl->renderer.reset();

@@ -5,8 +5,10 @@
 #pragma once
 
 #include <optional>
+#include "common/logging/log.h"
 #include "common/vector_math.h"
 #include "video_core/pica/packed_attribute.h"
+#include "video_core/pica/regs_shader.h"
 #include "video_core/pica_types.h"
 
 namespace Pica {
@@ -70,7 +72,31 @@ public:
 
     void WriteUniformIntReg(u32 index, const Common::Vec4<u8> values);
 
-    std::optional<u32> WriteUniformFloatReg(ShaderRegs& config, u32 value);
+    // Inline so the compiler can fold it into ProcessCmdList's hot loop —
+    // simpleperf measured this function as 0.78% of emu-thread cycles in
+    // SMB3DL with the function still living in shader_setup.cpp despite
+    // LTO. Hot path: 3 of every 4 calls (or 4 of 5 in float32 mode) just
+    // push to the queue and return std::nullopt; only the final call decodes
+    // and stores the Vec4 uniform.
+    std::optional<u32> WriteUniformFloatReg(ShaderRegs& config, u32 value) {
+        auto& uniform_setup = config.uniform_setup;
+        const bool is_float32 = uniform_setup.IsFloat32();
+        if (!uniform_queue.Push(value, is_float32)) [[likely]] {
+            return std::nullopt;
+        }
+
+        const auto uniform = uniform_queue.Get(is_float32);
+        if (uniform_setup.index >= uniforms.f.size()) [[unlikely]] {
+            LOG_ERROR(HW_GPU, "Invalid float uniform index {}", uniform_setup.index.Value());
+            return std::nullopt;
+        }
+
+        const u32 index = uniform_setup.index.Value();
+        const auto prev = std::exchange(uniforms.f[index], uniform);
+        uniforms_dirty |= prev != uniform;
+        uniform_setup.index.Assign(index + 1);
+        return index;
+    }
 
     u64 GetProgramCodeHash();
 

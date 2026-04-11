@@ -36,6 +36,7 @@ namespace VideoCore {
 constexpr u64 FRAME_TICKS = 4481136ull;
 
 class GraphicsDebugger;
+class GpuWorker;
 class RendererBase;
 class RightEyeDisabler;
 
@@ -101,6 +102,23 @@ public:
 
     /// Releases the renderer (for GL context destroy in libretro)
     void ReleaseRenderer();
+
+public:
+    // Worker-thread entry points. Called from GpuWorker::Loop when it
+    // dispatches a message. Contain the actual PICA/rasterizer/Vulkan
+    // work that used to run synchronously on the emu thread. Not intended
+    // to be called from outside the worker loop — the non-OnWorker public
+    // methods above are the producer entry points from the emu thread.
+    void ExecuteOnWorker(const Service::GSP::Command& command);
+    void VBlankOnWorker(s64 cycles_late);
+    void SetBufferSwapOnWorker(u32 screen_id, const Service::GSP::FrameBufferInfo& info);
+    void SetColorFillOnWorker(u32 raw);
+
+    // Deliver any interrupts the GpuWorker has deferred since the last
+    // drain. MUST run on the emu thread only. Called at the top of
+    // System::RunLoop (every dynarec slice) so guest threads see
+    // interrupts with sub-ms latency.
+    void DrainPendingInterrupts();
 
 private:
     void SubmitCmdList(u32 index);
