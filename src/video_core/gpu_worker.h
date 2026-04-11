@@ -42,10 +42,39 @@ struct GpuCmdSetColorFill {
     u32 raw;
 };
 
+// Deferred rasterizer-cache invalidation/flush requests, fed by dynarec
+// memory callbacks (Memory::RasterizerFlushVirtualRegion) so the
+// rasterizer cache stays single-writer (the worker). Without this, the
+// emu thread invalidating a Surface mid-draw race-frees the Surface
+// object the worker is currently dereferencing
+// (AccelerateDrawBatchInternal+164 SIGSEGV).
+//
+// FIFO ordering with cmdlists is what makes invalidation correct: the
+// guest does STR then SVC TriggerCmdReqQueue, both on the emu thread,
+// so the invalidate enqueues at T0 and the cmdlist enqueues at T1. The
+// worker processes invalidate first, then the new draw sees fresh
+// state.
+struct GpuCmdInvalidateRegion {
+    PAddr addr;
+    u32 size;
+};
+struct GpuCmdFlushRegion {
+    PAddr addr;
+    u32 size;
+};
+struct GpuCmdFlushAndInvalidateRegion {
+    PAddr addr;
+    u32 size;
+};
+struct GpuCmdClearAll {
+    bool flush;
+};
+
 struct GpuCmdFlush {};
 
 using GpuMessage = std::variant<GpuCmdExecute, GpuCmdVBlank, GpuCmdSetBufferSwap,
-                                GpuCmdSetColorFill, GpuCmdFlush>;
+                                GpuCmdSetColorFill, GpuCmdInvalidateRegion, GpuCmdFlushRegion,
+                                GpuCmdFlushAndInvalidateRegion, GpuCmdClearAll, GpuCmdFlush>;
 
 class GpuWorker {
 public:

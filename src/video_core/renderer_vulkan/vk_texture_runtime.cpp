@@ -304,7 +304,23 @@ VideoCore::StagingData TextureRuntime::FindStaging(u32 size, bool upload) {
 }
 
 u32 TextureRuntime::RemoveThreshold() {
-    return num_swapchain_images;
+    // Deferred deletion window for sentenced surfaces. The default
+    // (num_swapchain_images = 2..3) assumes draws are emitted and
+    // consumed on the same thread inside one frame. With the GpuWorker
+    // running cmdlist processing on a separate thread from the dynarec
+    // memory callbacks that invalidate surfaces, an in-flight worker
+    // draw can still be holding a Surface& or a Vulkan handle that's
+    // about to get destroyed by the GC. Bumping the threshold to ~1
+    // second of frames lets the worker + Vulkan scheduler consume any
+    // queued references before the underlying objects go away.
+    //
+    // Crashes this fixes:
+    //   * Vulkan::RasterizerVulkan::AccelerateDrawBatchInternal+164
+    //     SIGSEGV at fault addr 0x10 (use-after-free of Surface struct)
+    //   * Vulkan::Scheduler::WorkerThread → vk::endRenderPass crash
+    //     in libGLES_mali.so (Vulkan render pass / framebuffer freed
+    //     before the scheduler dispatched the recorded EndRendering)
+    return 240;
 }
 
 void TextureRuntime::Finish() {

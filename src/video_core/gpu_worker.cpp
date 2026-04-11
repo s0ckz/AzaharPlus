@@ -113,6 +113,14 @@ void GpuWorker::Loop(std::stop_token stop) {
                     gpu_owner->SetBufferSwapOnWorker(cmd.screen_id, cmd.info);
                 } else if constexpr (std::is_same_v<T, GpuCmdSetColorFill>) {
                     gpu_owner->SetColorFillOnWorker(cmd.raw);
+                } else if constexpr (std::is_same_v<T, GpuCmdInvalidateRegion>) {
+                    gpu_owner->InvalidateRegionOnWorker(cmd.addr, cmd.size);
+                } else if constexpr (std::is_same_v<T, GpuCmdFlushRegion>) {
+                    gpu_owner->FlushRegionOnWorker(cmd.addr, cmd.size);
+                } else if constexpr (std::is_same_v<T, GpuCmdFlushAndInvalidateRegion>) {
+                    gpu_owner->FlushAndInvalidateRegionOnWorker(cmd.addr, cmd.size);
+                } else if constexpr (std::is_same_v<T, GpuCmdClearAll>) {
+                    gpu_owner->ClearAllOnWorker(cmd.flush);
                 } else if constexpr (std::is_same_v<T, GpuCmdFlush>) {
                     flush_ack.Set();
                 }

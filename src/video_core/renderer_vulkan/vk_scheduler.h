@@ -48,12 +48,22 @@ public:
     void DispatchWork();
 
     /// Records the command to the current chunk.
+    /// Thread-safe: takes chunk_mutex so concurrent producers (the
+    /// GpuWorker recording draw commands AND the emu thread recording
+    /// SwapBuffers/FlushRegion/InvalidateRegion side-effect commands
+    /// from vk_texture_runtime / vk_blit_helper / etc.) don't race on
+    /// the `chunk` member. Without this, one thread mid-Record gets
+    /// chunk move'd-out from under it by another thread's DispatchWork
+    /// → crash at offset 0x10 inside CommandChunk::Record (the
+    /// `recorded_counts++` line) because `this` for the chunk became
+    /// the moved-from null unique_ptr.
     template <typename T>
     void Record(T&& command) {
+        std::scoped_lock lock{chunk_mutex};
         if (chunk->Record(command)) {
             return;
         }
-        DispatchWork();
+        DispatchWorkLocked();
         (void)chunk->Record(command);
     }
 
@@ -192,6 +202,10 @@ private:
 
     void AcquireNewChunk();
 
+    // Internal version of DispatchWork that assumes chunk_mutex is
+    // already held. Used by Record's overflow path.
+    void DispatchWorkLocked();
+
 private:
     std::unique_ptr<MasterSemaphore> master_semaphore;
     CommandPool command_pool;
@@ -205,6 +219,9 @@ private:
     std::mutex execution_mutex;
     std::mutex reserve_mutex;
     std::mutex queue_mutex;
+    // Protects the active `chunk` pointer against concurrent producer
+    // threads (multi-threaded Record / DispatchWork callers).
+    std::mutex chunk_mutex;
     std::condition_variable_any event_cv;
     std::jthread worker_thread;
     bool use_worker_thread;

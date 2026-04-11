@@ -99,6 +99,12 @@ void Scheduler::Wait(u64 tick) {
 }
 
 void Scheduler::DispatchWork() {
+    std::scoped_lock chunk_lock{chunk_mutex};
+    DispatchWorkLocked();
+}
+
+void Scheduler::DispatchWorkLocked() {
+    // Caller MUST hold chunk_mutex.
     if (!use_worker_thread || chunk->Empty()) {
         return;
     }
@@ -193,8 +199,11 @@ void Scheduler::SubmitExecution(vk::Semaphore signal_semaphore, vk::Semaphore wa
     if (!use_worker_thread) {
         AllocateWorkerCommandBuffers();
     } else {
+        // Take chunk_mutex before MarkSubmit + DispatchWork so the
+        // sequence stays atomic against concurrent Record() calls.
+        std::scoped_lock chunk_lock{chunk_mutex};
         chunk->MarkSubmit();
-        DispatchWork();
+        DispatchWorkLocked();
     }
 }
 

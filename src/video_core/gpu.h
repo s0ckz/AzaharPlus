@@ -53,12 +53,22 @@ public:
     void SetInterruptHandler(Service::GSP::InterruptHandler handler);
 
     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
+    /// SYNC: enqueues then drains the worker (rare path; called from
+    /// guest read paths that need GPU writebacks visible immediately).
     void FlushRegion(PAddr addr, u32 size);
 
     /// Notify rasterizer that any caches of the specified region should be invalidated
+    /// ASYNC: enqueues to the worker queue. Hot path — every dynarec
+    /// memory write that overlaps a rasterized region. FIFO ordering
+    /// with cmdlists ensures the next draw sees the invalidation.
     void InvalidateRegion(PAddr addr, u32 size);
 
+    /// Flush followed by invalidate (used by ReadBlock when the guest
+    /// is about to overwrite a region the GPU has dirtied). SYNC.
+    void FlushAndInvalidateRegion(PAddr addr, u32 size);
+
     /// Flushes and invalidates all memory in the rasterizer cache and removes any leftover state.
+    /// SYNC. Very rare (RecreateRenderer / save state / shutdown).
     void ClearAll(bool flush);
 
     /// Executes the provided GSP command.
@@ -113,6 +123,10 @@ public:
     void VBlankOnWorker(s64 cycles_late);
     void SetBufferSwapOnWorker(u32 screen_id, const Service::GSP::FrameBufferInfo& info);
     void SetColorFillOnWorker(u32 raw);
+    void InvalidateRegionOnWorker(PAddr addr, u32 size);
+    void FlushRegionOnWorker(PAddr addr, u32 size);
+    void FlushAndInvalidateRegionOnWorker(PAddr addr, u32 size);
+    void ClearAllOnWorker(bool flush);
 
     // Deliver any interrupts the GpuWorker has deferred since the last
     // drain. MUST run on the emu thread only. Called at the top of

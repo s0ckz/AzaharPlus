@@ -177,6 +177,16 @@ void GPU::DrainPendingInterrupts() {
     }
 }
 
+// Direct rasterizer forwarders. Memory::RasterizerFlushVirtualRegion
+// calls these (and rasterizer methods directly) on the emu thread.
+// Concurrent access against the worker is made safe by:
+//   1. SlotVector::erase deferring slot destruction until quiescent
+//      (so the worker's in-flight Surface& stays alive even if the
+//      cache map drops it).
+//   2. RasterizerMarkRegionCached writing pointer-then-attribute
+//      (with a release fence) so dynarec never sees attr=Memory with
+//      pointer=null.
+
 void GPU::FlushRegion(PAddr addr, u32 size) {
     impl->rasterizer->FlushRegion(addr, size);
 }
@@ -185,7 +195,28 @@ void GPU::InvalidateRegion(PAddr addr, u32 size) {
     impl->rasterizer->InvalidateRegion(addr, size);
 }
 
+void GPU::FlushAndInvalidateRegion(PAddr addr, u32 size) {
+    impl->rasterizer->FlushAndInvalidateRegion(addr, size);
+}
+
 void GPU::ClearAll(bool flush) {
+    impl->rasterizer->ClearAll(flush);
+}
+
+// Worker-side handlers — kept for the GpuMessage variant but unused
+// now that memory.cpp routes invalidations directly through the
+// rasterizer rather than queueing them. Reachable only via the legacy
+// GpuCmdInvalidateRegion etc. variants which we no longer push.
+void GPU::InvalidateRegionOnWorker(PAddr addr, u32 size) {
+    impl->rasterizer->InvalidateRegion(addr, size);
+}
+void GPU::FlushRegionOnWorker(PAddr addr, u32 size) {
+    impl->rasterizer->FlushRegion(addr, size);
+}
+void GPU::FlushAndInvalidateRegionOnWorker(PAddr addr, u32 size) {
+    impl->rasterizer->FlushAndInvalidateRegion(addr, size);
+}
+void GPU::ClearAllOnWorker(bool flush) {
     impl->rasterizer->ClearAll(flush);
 }
 

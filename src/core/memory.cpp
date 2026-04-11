@@ -281,6 +281,13 @@ public:
                 return;
             }
 
+            // Direct rasterizer call on the emu thread. This races with
+            // the GpuWorker's in-flight cmdlist processing on shared
+            // rasterizer_cache state — fix is in SlotVector::erase
+            // (deferred slot reclamation) + page-table write ordering
+            // in RasterizerMarkRegionCached, NOT by routing through the
+            // worker queue (which serializes the emu thread on the
+            // worker and halves throughput).
             auto& renderer = system.GPU().Renderer();
             VAddr overlap_start = std::max(start, region_start);
             VAddr overlap_end = std::min(end, region_end);
@@ -741,37 +748,56 @@ void MemorySystem::RasterizerMarkRegionCached(PAddr start, u32 size, bool cached
     u32 num_pages = ((start + size - 1) >> CITRA_PAGE_BITS) - (start >> CITRA_PAGE_BITS) + 1;
     PAddr paddr = start;
 
+    // CONCURRENCY NOTE: this runs on the GpuWorker thread (called from
+    // RasterizerCache mutations during cmdlist processing) while the emu
+    // thread's dynarec reads page_table->{pointers,attributes} every guest
+    // load/store with no lock. The dynarec fast path is:
+    //   p = pointers[idx]; if (p) memcpy(p+off, ...);
+    //   else switch on attributes[idx] { Memory: ASSERT_FAIL("no pointer"); ... }
+    // So the write order matters. The invariant the reader assumes is
+    //   attribute == Memory  ⇒  pointer != nullptr.
+    //
+    // For each transition we order the writes (with a release fence
+    // between them) so the reader can never see a transient state that
+    // violates that invariant.
     for (unsigned i = 0; i < num_pages; ++i, paddr += CITRA_PAGE_SIZE) {
         for (VAddr vaddr : PhysicalToVirtualAddressForRasterizer(paddr)) {
             impl->cache_marker.Mark(vaddr, cached);
             for (auto& page_table : impl->page_table_list) {
-                PageType& page_type = page_table->attributes[vaddr >> CITRA_PAGE_BITS];
+                const u64 idx = vaddr >> CITRA_PAGE_BITS;
+                PageType& page_type = page_table->attributes[idx];
 
                 if (cached) {
-                    // Switch page type to cached if now cached
+                    // Memory → RasterizerCachedMemory: pointer must
+                    // become null *after* attribute becomes Cached, so
+                    // the reader either sees (Memory, ptr) — fast path —
+                    // or (Cached, anything) — cached path. It must
+                    // never see (Memory, null).
                     switch (page_type) {
                     case PageType::Unmapped:
-                        // It is not necessary for a process to have this region mapped into its
-                        // address space, for example, a system module need not have a VRAM mapping.
                         break;
                     case PageType::Memory:
                         page_type = PageType::RasterizerCachedMemory;
-                        page_table->pointers[vaddr >> CITRA_PAGE_BITS] = nullptr;
+                        std::atomic_thread_fence(std::memory_order_release);
+                        page_table->pointers[idx] = nullptr;
                         break;
                     default:
                         UNREACHABLE();
                     }
                 } else {
-                    // Switch page type to uncached if now uncached
+                    // RasterizerCachedMemory → Memory: pointer must be
+                    // valid *before* attribute becomes Memory, so the
+                    // reader either sees (Cached, null) — cached path —
+                    // or (Memory, ptr) — fast path. It must never see
+                    // (Memory, null).
                     switch (page_type) {
                     case PageType::Unmapped:
-                        // It is not necessary for a process to have this region mapped into its
-                        // address space, for example, a system module need not have a VRAM mapping.
                         break;
                     case PageType::RasterizerCachedMemory: {
-                        page_type = PageType::Memory;
-                        page_table->pointers[vaddr >> CITRA_PAGE_BITS] =
+                        page_table->pointers[idx] =
                             GetPointerForRasterizerCache(vaddr & ~CITRA_PAGE_MASK);
+                        std::atomic_thread_fence(std::memory_order_release);
+                        page_type = PageType::Memory;
                         break;
                     }
                     default:
