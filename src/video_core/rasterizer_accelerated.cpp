@@ -98,36 +98,51 @@ RasterizerAccelerated::VertexArrayInfo RasterizerAccelerated::AnalyzeVertexArray
     if (is_indexed) {
         const auto& index_info = regs.pipeline.index_array;
         const PAddr address = vertex_attributes.GetPhysicalBaseAddress() + index_info.offset;
-        const u8* index_address_8 = memory.GetPhysicalPointer(address);
-        const u16* index_address_16 = reinterpret_cast<const u16*>(index_address_8);
         const bool index_u16 = index_info.format != 0;
 
         vertex_min = 0xFFFF;
         vertex_max = 0;
-        const u32 count = regs.pipeline.num_vertices;
+        u32 count = regs.pipeline.num_vertices;
         const u32 index_size = index_u16 ? 2 : 1;
         const u32 size = count * index_size;
         FlushRegion(address, size);
 
-        // Defensive: with the GpuWorker offload there's a tiny chance the
-        // worker reads pica regs in a transient state where num_vertices
-        // is unreasonable, or memory.GetPhysicalPointer returns nullptr
-        // because the index buffer addr was momentarily invalid. Bail out
-        // with neutral min/max instead of FindMinMax-ing a bogus span and
-        // SIGSEGVing inside libcitra-android.so.
-        // 3DS hardware caps num_vertices well below 65536 in practice; we
-        // pick a generous 4M as the panic threshold.
+        // Defensive: with the GpuWorker offload, this is the worker
+        // thread reading pica regs that could be in a transient bad
+        // state because the cmdlist parser is mid-write. We need to
+        // bound the index buffer span against the actual memory range
+        // available — clamping `count` alone isn't enough because the
+        // base address might land near the end of FCRAM and the span
+        // walks off the allocation, SIGSEGVing in FindMinMax+64 (a
+        // tombstone we hit repeatedly during long sessions).
+        // GetPhysicalRef returns a MemoryRef whose GetSize() reports
+        // remaining bytes from `address` to the end of the backing
+        // region, which is exactly what we need to clamp against.
+        const MemoryRef index_ref = memory.GetPhysicalRef(address);
+        const u8* index_address_8 = index_ref.GetPtr();
+        const u16* index_address_16 = reinterpret_cast<const u16*>(index_address_8);
         if (index_address_8 == nullptr || count == 0 || count > 0x400000) [[unlikely]] {
             vertex_min = 0;
             vertex_max = 0;
-        } else if (index_u16) {
-            const auto res = Common::FindMinMax({index_address_16, static_cast<size_t>(count)});
-            vertex_min = static_cast<u32>(res.first);
-            vertex_max = static_cast<u32>(res.second);
         } else {
-            const auto res = Common::FindMinMax({index_address_8, static_cast<size_t>(count)});
-            vertex_min = static_cast<u32>(res.first);
-            vertex_max = static_cast<u32>(res.second);
+            // Clamp count to whatever fits in the remaining bytes of
+            // the backing FCRAM/VRAM region.
+            const u32 max_count = static_cast<u32>(index_ref.GetSize()) / index_size;
+            if (count > max_count) [[unlikely]] {
+                count = max_count;
+            }
+            if (count == 0) [[unlikely]] {
+                vertex_min = 0;
+                vertex_max = 0;
+            } else if (index_u16) {
+                const auto res = Common::FindMinMax({index_address_16, static_cast<size_t>(count)});
+                vertex_min = static_cast<u32>(res.first);
+                vertex_max = static_cast<u32>(res.second);
+            } else {
+                const auto res = Common::FindMinMax({index_address_8, static_cast<size_t>(count)});
+                vertex_min = static_cast<u32>(res.first);
+                vertex_max = static_cast<u32>(res.second);
+            }
         }
     } else {
         vertex_min = regs.pipeline.vertex_offset;
