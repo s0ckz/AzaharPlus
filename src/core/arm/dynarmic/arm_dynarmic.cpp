@@ -335,6 +335,18 @@ std::unique_ptr<Dynarmic::A32::Jit> ARM_Dynarmic::MakeJit() {
     config.wall_clock_cntpct = true;
     config.always_little_endian = true;
 
+    // Fastmem: if the memory system set up a 4 GB host VA reservation
+    // backed by dual-mapped memfd regions, tell dynarmic to emit raw
+    // single-instruction host loads/stores instead of the page_table
+    // indirection path. On unmapped pages the host faults with SIGSEGV;
+    // dynarmic's built-in exception handler (exception_handler_posix.cpp)
+    // catches it and recompiles the block with the slow page_table path.
+    // Fastmem: single-instruction host loads/stores for guest memory.
+    if (u8* base = memory.GetFastmemBase()) {
+        config.fastmem_pointer = reinterpret_cast<uintptr_t>(base);
+        config.recompile_on_fastmem_failure = true;
+    }
+
 #ifdef ANDROID
     // ARM11 dynarec Fast mode. Measurement on the RK3568 handheld (Cortex-A55)
     // shows the "rest" PerfProbe bucket (= dynarec JIT) is ~11ms of an ~18ms
