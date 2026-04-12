@@ -2,6 +2,8 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <dynarmic/interface/A32/a32.h>
 #include <dynarmic/interface/optimization_flags.h>
@@ -257,14 +259,41 @@ void ARM_Dynarmic::PrepareReschedule() {
     }
 }
 
+// Diagnostic counters: how often does the guest spam JIT cache flushes?
+// Profile (perf-emu-slowspot.data) showed 4.48% of emu thread in
+// Dynarmic GetOrEmit, with 5.31% of THAT coming from
+// PerformRequestedCacheInvalidation — i.e. the JIT is being asked to
+// invalidate cached blocks during gameplay. These counters log the
+// frequency at 1 Hz so we can see whether it's a few rare flushes or
+// a per-frame storm.
+namespace {
+std::atomic<std::uint64_t> g_invalidate_range_count{0};
+std::atomic<std::uint64_t> g_invalidate_range_bytes{0};
+std::atomic<std::uint64_t> g_clear_cache_count{0};
+} // namespace
+
 void ARM_Dynarmic::ClearInstructionCache() {
+    g_clear_cache_count.fetch_add(1, std::memory_order_relaxed);
     for (const auto& j : jits) {
         j.second->ClearCache();
     }
 }
 
 void ARM_Dynarmic::InvalidateCacheRange(u32 start_address, std::size_t length) {
+    g_invalidate_range_count.fetch_add(1, std::memory_order_relaxed);
+    g_invalidate_range_bytes.fetch_add(length, std::memory_order_relaxed);
     jit->InvalidateCacheRange(start_address, length);
+
+    static auto last_log = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log).count() >= 1000) {
+        last_log = now;
+        const auto inv_count = g_invalidate_range_count.exchange(0, std::memory_order_relaxed);
+        const auto inv_bytes = g_invalidate_range_bytes.exchange(0, std::memory_order_relaxed);
+        const auto clr_count = g_clear_cache_count.exchange(0, std::memory_order_relaxed);
+        LOG_INFO(Core_ARM11, "JitFlushProbe inv_range/s={} inv_bytes/s={} clear_all/s={}",
+                 inv_count, inv_bytes, clr_count);
+    }
 }
 
 void ARM_Dynarmic::ClearExclusiveState() {

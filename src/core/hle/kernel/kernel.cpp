@@ -67,22 +67,32 @@ std::shared_ptr<Process> KernelSystem::GetCurrentProcess() const {
     return current_process;
 }
 
-void KernelSystem::SetCurrentProcess(std::shared_ptr<Process> process) {
+void KernelSystem::SetCurrentProcess(const std::shared_ptr<Process>& process) {
+    // Hot path: simpleperf shows ~0.87% of emu thread cycles in this
+    // function alone, even with the inner ARM_Dynarmic::SetPageTable
+    // already short-circuiting on identical page tables. The cost is
+    // the *cascade* of shared_ptr copies (each one is an atomic
+    // refcount inc/dec on ARM64) before we ever reach the
+    // already-deduped code below. SMB3DL is a single-process game so
+    // both ARM11 cores almost always run the same Process — make
+    // *that* the early-return point and we skip the entire cascade.
+    if (process == current_process) [[likely]] {
+        return;
+    }
     current_process = process;
     SetCurrentMemoryPageTable(process->vm_manager.page_table);
 }
 
-void KernelSystem::SetCurrentProcessForCPU(std::shared_ptr<Process> process, u32 core_id) {
+void KernelSystem::SetCurrentProcessForCPU(const std::shared_ptr<Process>& process, u32 core_id) {
     if (current_cpu->GetID() == core_id) {
-        current_process = process;
-        SetCurrentMemoryPageTable(process->vm_manager.page_table);
+        SetCurrentProcess(process);
     } else {
         stored_processes[core_id] = process;
         thread_managers[core_id]->cpu->SetPageTable(process->vm_manager.page_table);
     }
 }
 
-void KernelSystem::SetCurrentMemoryPageTable(std::shared_ptr<Memory::PageTable> page_table) {
+void KernelSystem::SetCurrentMemoryPageTable(const std::shared_ptr<Memory::PageTable>& page_table) {
     memory.SetCurrentPageTable(page_table);
     if (current_cpu != nullptr) {
         current_cpu->SetPageTable(page_table);
@@ -97,6 +107,15 @@ void KernelSystem::SetCPUs(std::vector<std::shared_ptr<Core::ARM_Interface>> cpu
 }
 
 void KernelSystem::SetRunningCPU(Core::ARM_Interface* cpu) {
+    // Hot path: called 4-5x per RunLoop iteration (twice per core in
+    // both the synced and catch-up loops). The shared_ptr write into
+    // stored_processes[] is the costliest piece — it's an atomic
+    // refcount swap on every call. Skip the swap when we're switching
+    // back to the same CPU (no-op switch) and skip the SetCurrentProcess
+    // cascade by relying on its own equality early-return.
+    if (current_cpu == cpu) [[unlikely]] {
+        return;
+    }
     if (current_process) {
         stored_processes[current_cpu->GetID()] = current_process;
     }

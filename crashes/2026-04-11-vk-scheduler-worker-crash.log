@@ -1,0 +1,32 @@
+--------- beginning of crash
+04-11 13:07:06.111 15676 17242 F libc    : Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x60 in tid 17242 (VulkanWorker), pid 15676 (lime3ds.android)
+04-11 13:07:07.966 17950 17950 F DEBUG   : *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** ***
+04-11 13:07:07.966 17950 17950 F DEBUG   : Build fingerprint: 'Anbernic/rk3568_u/rk3568_u:14/UQ1A.240205.004.B1/eng.builde.20251208.225701:userdebug/release-keys'
+04-11 13:07:07.966 17950 17950 F DEBUG   : Revision: '0'
+04-11 13:07:07.966 17950 17950 F DEBUG   : ABI: 'arm64'
+04-11 13:07:07.966 17950 17950 F DEBUG   : Timestamp: 2026-04-11 13:07:06.574667950-0300
+04-11 13:07:07.966 17950 17950 F DEBUG   : Process uptime: 651s
+04-11 13:07:07.966 17950 17950 F DEBUG   : Cmdline: io.github.lime3ds.android
+04-11 13:07:07.966 17950 17950 F DEBUG   : pid: 15676, tid: 17242, name: VulkanWorker  >>> io.github.lime3ds.android <<<
+04-11 13:07:07.966 17950 17950 F DEBUG   : uid: 10130
+04-11 13:07:07.966 17950 17950 F DEBUG   : tagged_addr_ctrl: 0000000000000001 (PR_TAGGED_ADDR_ENABLE)
+04-11 13:07:07.966 17950 17950 F DEBUG   : signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0000000000000060
+04-11 13:07:07.966 17950 17950 F DEBUG   : Cause: null pointer dereference
+04-11 13:07:07.966 17950 17950 F DEBUG   :     x0  b400007a6ccaf1b0  x1  000000785f7eb9e0  x2  0000000000000001  x3  0000000000000000
+04-11 13:07:07.966 17950 17950 F DEBUG   :     x4  00000000ffffffed  x5  0000000000000000  x6  0000000000000000  x7  0000000000000000
+04-11 13:07:07.966 17950 17950 F DEBUG   :     x8  0000000000000000  x9  0000000000000000  x10 0000000000000002  x11 0000000000000000
+04-11 13:07:07.966 17950 17950 F DEBUG   :     x12 0000000000000030  x13 000000000115d840  x14 b400007a6ccafb90  x15 00000003c44a27c0
+04-11 13:07:07.966 17950 17950 F DEBUG   :     x16 b400007a6ccafb80  x17 00000003c44a2580  x18 000000771b44e000  x19 000000785f7eb9e0
+04-11 13:07:07.966 17950 17950 F DEBUG   :     x20 b400007a6ccaf1b0  x21 000000785f7ec000  x22 00000077777250a0  x23 b400007a6ccb3670
+04-11 13:07:07.966 17950 17950 F DEBUG   :     x24 000000785f7ec000  x25 b400007a3cc8b808  x26 b4000079ecd88720  x27 0000000000000000
+04-11 13:07:07.966 17950 17950 F DEBUG   :     x28 b400007a6cc87410  x29 000000785f7ebad0
+04-11 13:07:07.967 17950 17950 F DEBUG   :     lr  00000078484707ac  sp  000000785f7eb8f0  pc  000000784988fa38  pst 0000000060001000
+04-11 13:07:07.967 17950 17950 F DEBUG   : 7 total frames
+04-11 13:07:07.967 17950 17950 F DEBUG   : backtrace:
+04-11 13:07:07.967 17950 17950 F DEBUG   :       #00 pc 0000000001e05a38  /vendor/lib64/egl/libGLES_mali.so (BuildId: fb2de64b8bd4d5a7)
+04-11 13:07:07.967 17950 17950 F DEBUG   :       #01 pc 00000000009e67a8  /vendor/lib64/egl/libGLES_mali.so (BuildId: fb2de64b8bd4d5a7)
+04-11 13:07:07.967 17950 17950 F DEBUG   :       #02 pc 0000000002137394  /data/app/~~yFFMiYxpyIfoObxqdros0g==/io.github.lime3ds.android-llGQunlhiRDyclJKRHv74A==/lib/arm64/libcitra-android.so (BuildId: 0913b84b3b2ade14c0e6b57463442574c50b61c8)
+04-11 13:07:07.967 17950 17950 F DEBUG   :       #03 pc 00000000021442a0  /data/app/~~yFFMiYxpyIfoObxqdros0g==/io.github.lime3ds.android-llGQunlhiRDyclJKRHv74A==/lib/arm64/libcitra-android.so (Vulkan::Scheduler::WorkerThread(std::stop_token)+748) (BuildId: 0913b84b3b2ade14c0e6b57463442574c50b61c8)
+04-11 13:07:07.967 17950 17950 F DEBUG   :       #04 pc 00000000021447d0  /data/app/~~yFFMiYxpyIfoObxqdros0g==/io.github.lime3ds.android-llGQunlhiRDyclJKRHv74A==/lib/arm64/libcitra-android.so (BuildId: 0913b84b3b2ade14c0e6b57463442574c50b61c8)
+04-11 13:07:07.967 17950 17950 F DEBUG   :       #05 pc 00000000000d6ccc  /apex/com.android.runtime/lib64/bionic/libc.so (__pthread_start(void*)+204) (BuildId: a017f07431ff6692304a0cae225962fb)
+04-11 13:07:07.967 17950 17950 F DEBUG   :       #06 pc 000000000006ab00  /apex/com.android.runtime/lib64/bionic/libc.so (__start_thread+64) (BuildId: a017f07431ff6692304a0cae225962fb)

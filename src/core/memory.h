@@ -253,7 +253,7 @@ public:
     void UnmapRegion(PageTable& page_table, VAddr base, u32 size);
 
     /// Currently active page table
-    void SetCurrentPageTable(std::shared_ptr<PageTable> page_table);
+    void SetCurrentPageTable(const std::shared_ptr<PageTable>& page_table);
     std::shared_ptr<PageTable> GetCurrentPageTable() const;
 
     /**

@@ -383,7 +383,7 @@ void MemorySystem::serialize(Archive& ar, const unsigned int file_version) {
 
 SERIALIZE_IMPL(MemorySystem)
 
-void MemorySystem::SetCurrentPageTable(std::shared_ptr<PageTable> page_table) {
+void MemorySystem::SetCurrentPageTable(const std::shared_ptr<PageTable>& page_table) {
     impl->current_page_table = page_table;
 }
 
