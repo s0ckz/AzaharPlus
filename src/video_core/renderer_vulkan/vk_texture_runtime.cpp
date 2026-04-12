@@ -320,11 +320,20 @@ u32 TextureRuntime::RemoveThreshold() {
     //   * Vulkan::Scheduler::WorkerThread → vk::endRenderPass crash
     //     in libGLES_mali.so (Vulkan render pass / framebuffer freed
     //     before the scheduler dispatched the recorded EndRendering)
-    return 240;
+    // 240 still crashed after 2+ hours in MK7. The Vulkan scheduler
+    // pipeline can have chunks queued across multiple frames, and
+    // Surface eviction under heavy cache pressure can sentence AND
+    // destroy within a smaller window than expected. Bump to 4096
+    // (~68 seconds at 60fps) as a much wider safety margin.
+    return 4096;
 }
 
 void TextureRuntime::Finish() {
     scheduler.Finish();
+}
+
+void TextureRuntime::WaitForWorker() {
+    scheduler.WaitWorker();
 }
 
 bool TextureRuntime::Reinterpret(Surface& source, Surface& dest,

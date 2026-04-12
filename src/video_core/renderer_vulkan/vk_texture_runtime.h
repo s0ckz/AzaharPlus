@@ -131,6 +131,11 @@ public:
     /// Submits and waits for current GPU work.
     void Finish();
 
+    /// Drains the Vulkan scheduler's work queue so all in-flight
+    /// command chunks have been consumed. Called before destroying
+    /// sentenced surfaces to ensure no chunk holds a stale VkImageView.
+    void WaitForWorker();
+
     /// Maps an internal staging buffer of the provided size for pixel uploads/downloads
     VideoCore::StagingData FindStaging(u32 size, bool upload);
 

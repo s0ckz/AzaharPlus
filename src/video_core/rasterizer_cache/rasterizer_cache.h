@@ -114,6 +114,37 @@ void RasterizerCache<T>::TickFrame() {
 template <class T>
 void RasterizerCache<T>::RunGarbageCollector() {
     frame_tick++;
+
+    // First pass: check if any sentenced surfaces are ready to die.
+    bool has_expired = false;
+    for (const auto& [surface_id, tick] : sentenced) {
+        if (frame_tick - tick > runtime.RemoveThreshold()) {
+            has_expired = true;
+            break;
+        }
+    }
+
+    // If surfaces are about to be destroyed, drain the Vulkan
+    // scheduler's work queue first. Recorded command lambdas capture
+    // VkImageView / VkImage handles by value; if a Surface is
+    // destroyed while its handles are still in an unprocessed chunk,
+    // the WorkerThread crashes inside the Mali driver
+    // (WorkerThread+748 SIGSEGV at offset 0x60 — a null deref on a
+    // freed driver-internal struct). WaitWorker ensures every chunk
+    // has been consumed, so no handle is in-flight at destruction
+    // time. The cost is one GPU sync point per GC cycle with
+    // expired surfaces — at RemoveThreshold=4096 that's roughly
+    // once per minute, negligible.
+    if (has_expired) {
+        // Vulkan runtime: drain the scheduler's work queue so no
+        // chunk holds a stale VkImageView. OpenGL runtime doesn't
+        // have WaitForWorker — the `if constexpr` compiles it away.
+        if constexpr (requires { runtime.WaitForWorker(); }) {
+            runtime.WaitForWorker();
+        }
+    }
+
+    // Second pass: actually destroy the expired surfaces.
     for (auto it = sentenced.begin(); it != sentenced.end();) {
         const auto [surface_id, tick] = *it;
         if (frame_tick - tick <= runtime.RemoveThreshold()) {
