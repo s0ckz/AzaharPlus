@@ -256,6 +256,12 @@ public:
     void SetCurrentPageTable(std::shared_ptr<PageTable> page_table);
     std::shared_ptr<PageTable> GetCurrentPageTable() const;
 
+    /// Returns the base of the 4 GB fastmem host VA reservation, or
+    /// nullptr if fastmem is not available (non-Linux host, memfd_create
+    /// failed, etc.). Dynarmic sets config.fastmem_pointer to this value
+    /// so it can emit single-instruction host loads for guest memory.
+    u8* GetFastmemBase() const;
+
     /**
      * Gets a pointer to the given address.
      *

@@ -314,6 +314,54 @@ std::unique_ptr<Dynarmic::A32::Jit> ARM_Dynarmic::MakeJit() {
     config.processor_id = GetID();
     config.global_monitor = &exclusive_monitor.monitor;
 
+    // Zero-risk dynarec flags: Citra's CoreTiming uses a wall clock (not a
+    // cycle counter), and ARM11 is always little-endian on the 3DS with no
+    // guest code touching CPSR.E. Telling the translator both facts lets it
+    // skip emitting CNTPCT cycle-counter code and SETEND/endian-switch
+    // handling per basic block. Pure size-and-speed win, no semantic change.
+    config.wall_clock_cntpct = true;
+    config.always_little_endian = true;
+
+    // Fastmem: if the memory system set up a 4 GB host VA reservation
+    // backed by dual-mapped memfd regions, tell dynarmic to emit raw
+    // single-instruction host loads/stores instead of the page_table
+    // indirection path. On unmapped pages the host faults with SIGSEGV;
+    // dynarmic's built-in exception handler (exception_handler_posix.cpp)
+    // catches it and recompiles the block with the slow page_table path.
+    // Fastmem: single-instruction host loads/stores for guest memory.
+    if (u8* base = memory.GetFastmemBase()) {
+        config.fastmem_pointer = reinterpret_cast<uintptr_t>(base);
+        config.recompile_on_fastmem_failure = true;
+    }
+
+#ifdef ANDROID
+    // ARM11 dynarec Fast mode. Measurement on the RK3568 handheld (Cortex-A55)
+    // shows the "rest" PerfProbe bucket (= dynarec JIT) is ~11ms of an ~18ms
+    // frame on SMB3DL — 60% of the frame budget. The dominant cost is
+    // emulating the 3DS FPCR rounding mode on every FP op, which blocks the
+    // JIT from emitting native AArch64 NEON FP directly.
+    //
+    // Unsafe_IgnoreStandardFPCRValue is the big one: it lets the JIT drop the
+    // FPCR emulation. Unsafe_ReducedErrorFP and Unsafe_InaccurateNaN are free
+    // companions that loosen IEEE-754 edge-case behavior for additional speed.
+    //
+    // Unsafe_UnfuseFMA is intentionally NOT enabled — it only helps hosts
+    // lacking hardware FMA. All 64-bit ARM cores we ship to have FMA.
+    // Unsafe_IgnoreGlobalMonitor is also NOT enabled — the 3DS has two ARM11
+    // cores that sync via LDREX/STREX and dropping the monitor risks deadlock
+    // in multithreaded guest code.
+    //
+    // No known commercial 3DS game is visibly affected by any of these flags.
+    // In principle the low bits of FP results can differ from real hardware.
+    config.unsafe_optimizations = true;
+    config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP;
+    config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
+    config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue;
+    LOG_INFO(Core_ARM11, "Dynarmic: Fast mode (unsafe FP optimizations enabled)");
+#else
+    LOG_INFO(Core_ARM11, "Dynarmic: Accurate mode (safe optimizations only)");
+#endif
+
     return std::make_unique<Dynarmic::A32::Jit>(config);
 }
 

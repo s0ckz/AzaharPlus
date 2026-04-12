@@ -4,6 +4,13 @@
 
 #include <array>
 #include <cstring>
+
+#if defined(__linux__) || defined(__ANDROID__)
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 #include <boost/serialization/array.hpp>
 #include <boost/serialization/binary_object.hpp>
 #include "audio_core/dsp_interface.h"
@@ -84,14 +91,90 @@ private:
     }
 };
 
+// Helper: allocate a memory region backed by memfd (Linux/Android) so it
+// can be dual-mapped into both a "canonical" host address (for Citra's
+// internal pointers) and the fastmem 4 GB VA reservation (for dynarmic's
+// single-instruction guest loads/stores). On non-Linux platforms, falls
+// back to a plain heap allocation — fastmem is simply disabled.
+struct MemfdRegion {
+    u8* ptr = nullptr;
+    std::size_t size = 0;
+    int fd = -1; // memfd file descriptor, -1 = heap fallback
+
+    MemfdRegion() = default;
+    explicit MemfdRegion(std::size_t sz) : size{sz} {
+#if defined(__linux__) || defined(__ANDROID__)
+        fd = static_cast<int>(syscall(__NR_memfd_create, "citra_guest_mem", 0));
+        if (fd >= 0) {
+            if (ftruncate(fd, static_cast<off_t>(sz)) == 0) {
+                ptr = static_cast<u8*>(
+                    mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+                if (ptr == MAP_FAILED) {
+                    ptr = nullptr;
+                }
+            }
+            if (!ptr) {
+                close(fd);
+                fd = -1;
+            }
+        }
+#endif
+        // Fallback: plain heap (no fastmem).
+        if (!ptr) {
+            ptr = new u8[sz]();
+        }
+    }
+    ~MemfdRegion() {
+#if defined(__linux__) || defined(__ANDROID__)
+        if (fd >= 0) {
+            munmap(ptr, size);
+            close(fd);
+            return;
+        }
+#endif
+        delete[] ptr;
+    }
+    MemfdRegion(const MemfdRegion&) = delete;
+    MemfdRegion& operator=(const MemfdRegion&) = delete;
+    MemfdRegion(MemfdRegion&& o) noexcept
+        : ptr{o.ptr}, size{o.size}, fd{o.fd} {
+        o.ptr = nullptr;
+        o.size = 0;
+        o.fd = -1;
+    }
+    MemfdRegion& operator=(MemfdRegion&& o) noexcept {
+        std::swap(ptr, o.ptr);
+        std::swap(size, o.size);
+        std::swap(fd, o.fd);
+        return *this;
+    }
+
+    u8* get() const { return ptr; }
+    bool IsMemfd() const { return fd >= 0; }
+};
+
 class MemorySystem::Impl {
 public:
-    // Visual Studio would try to allocate these on compile time
-    // if they are std::array which would exceed the memory limit.
-    std::unique_ptr<u8[]> fcram = std::make_unique<u8[]>(Memory::FCRAM_N3DS_SIZE);
-    std::unique_ptr<u8[]> vram = std::make_unique<u8[]>(Memory::VRAM_SIZE);
-    std::unique_ptr<u8[]> n3ds_extra_ram = std::make_unique<u8[]>(Memory::N3DS_EXTRA_RAM_SIZE);
-    std::unique_ptr<u8[]> dsp_ram = std::make_unique<u8[]>(Memory::DSP_RAM_SIZE);
+    // Guest physical memory regions. Backed by memfd on Linux/Android
+    // (enables dual-mapping for fastmem); heap-backed elsewhere.
+    MemfdRegion fcram{Memory::FCRAM_N3DS_SIZE};
+    MemfdRegion vram{Memory::VRAM_SIZE};
+    MemfdRegion n3ds_extra_ram{Memory::N3DS_EXTRA_RAM_SIZE};
+    MemfdRegion dsp_ram{Memory::DSP_RAM_SIZE};
+
+    // 4 GB fastmem VA reservation. When non-null, dynarmic emits
+    // single-instruction host loads/stores as:
+    //   ldr reg, [fastmem_base, guest_va_reg]
+    // Pages that aren't mapped in the guest VA land on PROT_NONE
+    // and trigger a SIGSEGV caught by dynarmic's built-in handler,
+    // which recompiles the block with the slow page_table path.
+    u8* fastmem_base = nullptr;
+    static constexpr std::size_t FASTMEM_SIZE = 4ULL * 1024 * 1024 * 1024; // 4 GB
+    // Track which page table was last bulk-mapped into the fastmem
+    // reservation so we don't redo 34K mmap calls on every
+    // SetCurrentPageTable (which is called hundreds of times/sec
+    // from the RunLoop dispatch). Raw pointer — no ownership.
+    PageTable* fastmem_mapped_page_table = nullptr;
 
     Core::System& system;
     std::shared_ptr<PageTable> current_page_table = nullptr;
@@ -106,6 +189,24 @@ public:
     PAddr plugin_fb_address{};
 
     Impl(Core::System& system_);
+    ~Impl();
+
+    // Map/unmap a single guest page in the fastmem VA reservation.
+    // Called from MapPages for every page that transitions between
+    // mapped and unmapped. When mapping, we mmap the backing memfd
+    // page at `fastmem_base + guest_va` so dynarmic can do a single
+    // host load instruction. When unmapping, we restore PROT_NONE at
+    // that offset so a stale guest access triggers the SIGSEGV
+    // recompile path.
+    void FastmemMap(u32 page_index, MemoryRef memory);
+    void FastmemMapPtr(u32 page_index, u8* host_ptr);
+    void FastmemUnmap(u32 page_index);
+
+    // Given a host pointer into one of our MemfdRegion backing
+    // allocations, return the memfd FD and the offset within it.
+    // Returns false if the pointer isn't in any known region (or if
+    // the region isn't memfd-backed).
+    bool GetMemfdForPointer(const u8* ptr, int& out_fd, off_t& out_offset) const;
 
     const u8* GetPtr(Region r) const {
         switch (r) {
@@ -364,10 +465,113 @@ MemorySystem::Impl::Impl(Core::System& system_)
     : system{system_}, fcram_mem(std::make_shared<BackingMemImpl<Region::FCRAM>>(*this)),
       vram_mem(std::make_shared<BackingMemImpl<Region::VRAM>>(*this)),
       n3ds_extra_ram_mem(std::make_shared<BackingMemImpl<Region::N3DS>>(*this)),
-      dsp_mem(std::make_shared<BackingMemImpl<Region::DSP>>(*this)) {}
+      dsp_mem(std::make_shared<BackingMemImpl<Region::DSP>>(*this)) {
+#if defined(__linux__) || defined(__ANDROID__)
+    // Reserve 4 GB of host virtual address space for fastmem. No
+    // physical memory is committed (MAP_NORESERVE + PROT_NONE) — just
+    // VA space. Individual pages get mmap'd with MAP_FIXED as the
+    // guest maps them, backed by the same memfd regions used for the
+    // canonical host pointers. On access, dynarmic emits a single
+    // `ldr reg, [fastmem_base, guest_va_reg]`; if the page is
+    // unmapped the SIGSEGV is caught by dynarmic's built-in handler
+    // which recompiles the block with the slow page_table path.
+    //
+    // Requires ALL backing regions to be memfd-backed (IsMemfd()==true).
+    // If any fell back to heap, fastmem is disabled silently.
+    LOG_CRITICAL(HW_Memory,
+                 "Fastmem init: fcram.memfd={} vram.memfd={} n3ds.memfd={} dsp.memfd={} "
+                 "fcram.ptr={:p} fcram.sz={}",
+                 fcram.IsMemfd(), vram.IsMemfd(), n3ds_extra_ram.IsMemfd(), dsp_ram.IsMemfd(),
+                 (void*)fcram.get(), fcram.size);
+    if (fcram.IsMemfd() && vram.IsMemfd() && n3ds_extra_ram.IsMemfd() && dsp_ram.IsMemfd()) {
+        void* reservation = mmap(nullptr, FASTMEM_SIZE, PROT_NONE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (reservation != MAP_FAILED) {
+            fastmem_base = static_cast<u8*>(reservation);
+            LOG_INFO(HW_Memory, "Fastmem: reserved 4 GB at {:p}", (void*)fastmem_base);
+        } else {
+            LOG_WARNING(HW_Memory, "Fastmem: failed to reserve 4 GB VA space (errno={})", errno);
+        }
+    } else {
+        LOG_WARNING(HW_Memory, "Fastmem: disabled (one or more regions fell back to heap)");
+    }
+#endif
+}
+
+MemorySystem::Impl::~Impl() {
+#if defined(__linux__) || defined(__ANDROID__)
+    if (fastmem_base) {
+        munmap(fastmem_base, FASTMEM_SIZE);
+        fastmem_base = nullptr;
+    }
+#endif
+}
+
+bool MemorySystem::Impl::GetMemfdForPointer(const u8* ptr, int& out_fd,
+                                            off_t& out_offset) const {
+    // Check each region to see if `ptr` falls inside it.
+    struct RegionInfo {
+        const MemfdRegion& region;
+    };
+    const RegionInfo regions[] = {
+        {fcram}, {vram}, {n3ds_extra_ram}, {dsp_ram},
+    };
+    for (const auto& ri : regions) {
+        if (!ri.region.IsMemfd()) continue;
+        const u8* base = ri.region.get();
+        if (ptr >= base && ptr < base + ri.region.size) {
+            out_fd = ri.region.fd;
+            out_offset = static_cast<off_t>(ptr - base);
+            return true;
+        }
+    }
+    return false;
+}
+
+void MemorySystem::Impl::FastmemMapPtr(u32 page_index, u8* host_ptr) {
+#if defined(__linux__) || defined(__ANDROID__)
+    if (!fastmem_base || !host_ptr) return;
+
+    int fd = -1;
+    off_t offset = 0;
+    if (!GetMemfdForPointer(host_ptr, fd, offset)) return;
+
+    offset &= ~(static_cast<off_t>(CITRA_PAGE_SIZE) - 1);
+
+    void* target = fastmem_base + (static_cast<std::size_t>(page_index) << CITRA_PAGE_BITS);
+    void* result = mmap(target, CITRA_PAGE_SIZE, PROT_READ | PROT_WRITE,
+                        MAP_FIXED | MAP_SHARED, fd, offset);
+    if (result == MAP_FAILED) {
+        LOG_ERROR(HW_Memory, "Fastmem: mmap failed for page {:08X} (errno={})",
+                  page_index << CITRA_PAGE_BITS, errno);
+    }
+#endif
+}
+
+void MemorySystem::Impl::FastmemMap(u32 page_index, MemoryRef memory) {
+    FastmemMapPtr(page_index, memory.GetPtr());
+}
+
+void MemorySystem::Impl::FastmemUnmap(u32 page_index) {
+#if defined(__linux__) || defined(__ANDROID__)
+    if (!fastmem_base) return;
+
+    void* target = fastmem_base + (static_cast<std::size_t>(page_index) << CITRA_PAGE_BITS);
+    // Overwrite with a PROT_NONE anonymous page, restoring the
+    // "unmapped" state in the fastmem reservation. Any access here
+    // from JIT'd code will fault → dynarmic's SIGSEGV handler →
+    // block recompiled with slow page_table path.
+    mmap(target, CITRA_PAGE_SIZE, PROT_NONE,
+         MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#endif
+}
 
 MemorySystem::MemorySystem(Core::System& system) : impl(std::make_unique<Impl>(system)) {}
 MemorySystem::~MemorySystem() = default;
+
+u8* MemorySystem::GetFastmemBase() const {
+    return impl->fastmem_base;
+}
 
 template <class Archive>
 void MemorySystem::serialize(Archive& ar, const unsigned int file_version) {
@@ -378,6 +582,30 @@ SERIALIZE_IMPL(MemorySystem)
 
 void MemorySystem::SetCurrentPageTable(std::shared_ptr<PageTable> page_table) {
     impl->current_page_table = page_table;
+
+#if defined(__linux__) || defined(__ANDROID__)
+    // Rebuild the entire fastmem 4 GB reservation from this page
+    // table's entries. During boot, many pages are mapped via MapPages
+    // BEFORE SetCurrentPageTable is called, so the MapPages hook
+    // (which only maps when &page_table == current_page_table) missed
+    // them. This bulk pass catches all of those.
+    if (impl->fastmem_base && page_table &&
+        page_table.get() != impl->fastmem_mapped_page_table) {
+        // Bulk-map the entire page table into the 4 GB fastmem
+        // reservation. Only runs when the page table CHANGES (new
+        // process, boot-up), NOT on the hundreds of per-second
+        // SetCurrentPageTable calls from RunLoop dispatch for the
+        // SAME page table. The fastmem_mapped_page_table pointer
+        // tracks which page table is "current" in the reservation.
+        for (u32 i = 0; i < PAGE_TABLE_NUM_ENTRIES; ++i) {
+            u8* ptr = static_cast<u8*>(page_table->pointers[i]);
+            if (page_table->attributes[i] == PageType::Memory && ptr != nullptr) {
+                impl->FastmemMapPtr(i, ptr);
+            }
+        }
+        impl->fastmem_mapped_page_table = page_table.get();
+    }
+#endif
 }
 
 std::shared_ptr<PageTable> MemorySystem::GetCurrentPageTable() const {
@@ -413,6 +641,21 @@ void MemorySystem::MapPages(PageTable& page_table, u32 base, u32 size, MemoryRef
         if (type == PageType::Memory && impl->cache_marker.IsCached(base * CITRA_PAGE_SIZE)) {
             page_table.attributes[base] = PageType::RasterizerCachedMemory;
             page_table.pointers[base] = nullptr;
+        }
+
+        // Mirror the mapping into the fastmem 4 GB VA reservation so
+        // dynarmic can emit single-instruction host loads/stores for
+        // guest memory accesses. Only the CURRENT page table's pages
+        // are mapped in fastmem (Citra uses a single address space
+        // for the running process; on context switch the entire
+        // fastmem mapping is rebuilt — rare for single-process games
+        // like SMB3DL).
+        if (impl->fastmem_base && &page_table == impl->current_page_table.get()) {
+            if (type == PageType::Memory && memory.GetPtr() != nullptr) {
+                impl->FastmemMap(base, memory);
+            } else {
+                impl->FastmemUnmap(base);
+            }
         }
 
         base += 1;
