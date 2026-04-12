@@ -294,6 +294,14 @@ public:
     static s64 GenerateBaseTicks();
 
 private:
+    // Returns the timer the calling host thread is currently
+    // dispatching for. With two host threads (emu thread for ARM11
+    // Core 0, core1_worker for Core 1) this checks a per-thread
+    // override first; falls back to the regular `current_timer`
+    // member when no override is set (paths that read core_timing
+    // from a thread that hasn't entered RunCoreSlice yet).
+    Timer* GetEffectiveCurrentTimer() const;
+
     // unordered_map stores each element separately as a linked list node so pointers to
     // elements remain stable regardless of rehashes/resizing.
     std::unordered_map<std::string, TimingEventType> event_types = {};

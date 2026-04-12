@@ -346,7 +346,25 @@ public:
     /// Map of named ports managed by the kernel, which can be retrieved using the ConnectToPort
     std::unordered_map<std::string, std::shared_ptr<ClientPort>> named_ports;
 
-    Core::ARM_Interface* current_cpu = nullptr;
+    // Per-host-thread "current ARM11 CPU" pointer. Set by
+    // SetRunningCPU on whichever host thread is currently dispatching
+    // a core's slice. Originally a single member; now static
+    // thread_local so that when ARM11 Core 1 is run on a worker host
+    // thread in parallel with Core 0 on the emu thread, each host
+    // thread has its own perception of "which CPU is the kernel
+    // currently looking at" — and downstream code like
+    // GetCurrentThreadManager() naturally returns the right
+    // ThreadManager without taking a lock.
+    //
+    // The HLE kernel SVC dispatch (SVC::CallSVC in svc.cpp) takes
+    // GetHLELock() so concurrent SVC bodies are still serialized;
+    // current_cpu is read inside the SVC body without lock contention
+    // and is correct for whichever thread entered it.
+    //
+    // static so it can be `thread_local` (C++17 forbids per-instance
+    // thread_local class members). Citra has exactly one KernelSystem
+    // instance per process so the static-ness is fine.
+    static thread_local Core::ARM_Interface* current_cpu;
 
     Memory::MemorySystem& memory;
 

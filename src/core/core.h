@@ -6,9 +6,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <boost/optional.hpp>
 #include <boost/serialization/version.hpp>
 #include "common/common_types.h"
@@ -194,9 +196,18 @@ public:
      * @returns A reference to the emulated CPU.
      */
 
-    [[nodiscard]] ARM_Interface& GetRunningCore() {
-        return *running_core;
-    };
+    [[nodiscard]] ARM_Interface& GetRunningCore();
+
+    // Per-thread "running core" override. Set by RunCoreSlice on the
+    // host thread that is currently dispatching a core's Run()/Step()
+    // call. When a worker host thread runs ARM11 Core 1 in parallel
+    // with the emu host thread running Core 0, each thread needs its
+    // own perception of "what core am I" so that SVC handlers and any
+    // other code that calls GetRunningCore() see THEIR core, not the
+    // other thread's. Defined out-of-line in core.cpp; the thread_local
+    // storage lives in an anonymous namespace there.
+    static void SetThreadLocalRunningCore(ARM_Interface* core);
+    static ARM_Interface* GetThreadLocalRunningCore();
 
     /**
      * Gets a reference to the emulated CPU.
@@ -396,6 +407,35 @@ private:
     /// Reschedule the core emulation
     void Reschedule();
 
+    /// Per-core slice dispatch — installs the thread-local running
+    /// core, sets the next slice on the timer, calls Reschedule on the
+    /// per-core ThreadManager, and then runs Run()/Step() on the
+    /// dynarec for `slice` cycles. Both cores' slices are dispatched
+    /// in parallel: the emu thread runs Core 0 while the dedicated
+    /// core1_worker host thread runs Core 1 (see Core1WorkerLoop /
+    /// StartCore1Worker / StopCore1Worker below).
+    void RunCoreSlice(ARM_Interface* core, s64 slice, bool tight_loop);
+
+    /// Core 1 worker thread plumbing. The emu thread dispatches Core
+    /// 0 inline while the worker thread dispatches Core 1 in parallel
+    /// — both via RunCoreSlice. Synchronization is per-slice
+    /// barrier-style: emu thread sets worker_state = Requested + the
+    /// slice/tight_loop parameters under worker_mutex and notifies
+    /// worker_request_cv; worker takes the lock, transitions to
+    /// Running, releases the lock, runs RunCoreSlice, then takes the
+    /// lock again, transitions to Done, and notifies
+    /// worker_done_cv. Emu thread waits on worker_done_cv between
+    /// signaling and continuing.
+    enum class Core1WorkerState : u8 {
+        Idle,      ///< Worker is sleeping in cv.wait
+        Requested, ///< Emu thread asked for a slice
+        Done,      ///< Worker finished its slice
+        Stop,      ///< Shutdown sentinel
+    };
+    void Core1WorkerLoop(std::stop_token stop);
+    void StartCore1Worker();
+    void StopCore1Worker();
+
     /// AppLoader used to load the current executing application
     std::unique_ptr<Loader::AppLoader> app_loader;
 
@@ -409,11 +449,26 @@ private:
     std::vector<std::shared_ptr<ARM_Interface>> cpu_cores;
     ARM_Interface* running_core = nullptr;
 
+    /// Core 1 worker thread state. Lives for the duration of System
+    /// (started in Init after cpu_cores are populated, joined in
+    /// Shutdown). The worker spends nearly all its time blocked on
+    /// core1_worker_request_cv waiting for the emu thread to hand it
+    /// a slice.
+    std::unique_ptr<std::jthread> core1_worker;
+    std::mutex core1_worker_mutex;
+    std::condition_variable core1_worker_request_cv;
+    std::condition_variable core1_worker_done_cv;
+    Core1WorkerState core1_worker_state{Core1WorkerState::Idle};
+    s64 core1_worker_slice_request{0};
+    bool core1_worker_tight_loop{false};
+
     /// DSP core
     std::unique_ptr<AudioCore::DspInterface> dsp_core;
 
-    /// When true, signals that a reschedule should happen
-    bool reschedule_pending{};
+    /// When true, signals that a reschedule should happen. Atomic
+    /// because both host threads (emu and core1_worker) write to it
+    /// from inside SVC handlers via System::PrepareReschedule.
+    std::atomic<bool> reschedule_pending{};
 
     std::unique_ptr<VideoCore::GPU> gpu;
 

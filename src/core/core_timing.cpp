@@ -23,6 +23,28 @@ bool Timing::Event::operator<(const Timing::Event& right) const {
     return std::tie(time, fifo_order) < std::tie(right.time, right.fifo_order);
 }
 
+namespace {
+// Per-host-thread "current" timer pointer. Set by SetCurrentTimer on
+// whichever thread is currently dispatching a core's slice. Reads
+// (in ScheduleEvent / GetTicks) prefer this thread-local override
+// over the regular `current_timer` member, so when ARM11 Core 1 is
+// run on the core1_worker host thread in parallel with Core 0 on the
+// emu thread, each thread sees its own current timer.
+//
+// Falls back to the legacy member when null (e.g. paths that call
+// core_timing from a thread that hasn't entered RunCoreSlice yet —
+// the constructor below initializes the legacy member to timers[0]
+// so even those callers get a valid timer).
+thread_local Timing::Timer* tls_current_timer = nullptr;
+} // namespace
+
+Timing::Timer* Timing::GetEffectiveCurrentTimer() const {
+    if (tls_current_timer) [[likely]] {
+        return tls_current_timer;
+    }
+    return current_timer;
+}
+
 Timing::Timing(std::size_t num_cores, u32 cpu_clock_percentage, s64 override_base_ticks) {
     // Generate non-zero base tick count to simulate time the system ran before launching the game.
     // This accounts for games that rely on the system tick to seed randomness.
@@ -72,7 +94,10 @@ void Timing::ScheduleEvent(s64 cycles_into_future, const TimingEventType* event_
     ASSERT(event_type != nullptr);
     Timing::Timer* timer = nullptr;
     if (core_id == std::numeric_limits<std::size_t>::max()) {
-        timer = current_timer;
+        // No core_id specified — use the calling host thread's
+        // current timer (per-thread override, so two host threads
+        // each get their own perception).
+        timer = GetEffectiveCurrentTimer();
     } else {
         ASSERT(core_id < timers.size());
         timer = timers.at(core_id).get();
@@ -89,7 +114,7 @@ void Timing::ScheduleEvent(s64 cycles_into_future, const TimingEventType* event_
                                    user_data, event_type});
     } else {
         s64 timeout = timer->GetTicks() + cycles_into_future;
-        if (current_timer == timer) {
+        if (GetEffectiveCurrentTimer() == timer) {
             // If this event needs to be scheduled before the next advance(), force one early
             if (!timer->is_timer_sane)
                 timer->ForceExceptionCheck(cycles_into_future);
@@ -140,11 +165,19 @@ void Timing::RemoveEvent(const TimingEventType* event_type) {
 }
 
 void Timing::SetCurrentTimer(std::size_t core_id) {
+    // Set both the per-thread override (so this thread's reads see
+    // the right timer) and the legacy member (for paths that read it
+    // outside of any per-thread context — and for save state). With
+    // two host threads writing the legacy member concurrently the
+    // pointer write is benignly racy: pointer stores are atomic on
+    // aarch64 and either thread's value is a valid Timer* — readers
+    // that need correctness use GetEffectiveCurrentTimer().
+    tls_current_timer = timers[core_id].get();
     current_timer = timers[core_id].get();
 }
 
 s64 Timing::GetTicks() const {
-    return current_timer->GetTicks();
+    return GetEffectiveCurrentTimer()->GetTicks();
 }
 
 s64 Timing::GetGlobalTicks() const {

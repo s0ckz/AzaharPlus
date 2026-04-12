@@ -5,6 +5,13 @@
 #include <stdexcept>
 #include <utility>
 #include <boost/serialization/array.hpp>
+
+#if defined(__linux__) || defined(__ANDROID__)
+#include <pthread.h>
+#include <sched.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 #include "audio_core/dsp_interface.h"
 #include "audio_core/hle/hle.h"
 #include "audio_core/lle/lle.h"
@@ -76,6 +83,155 @@ Core::Timing& Global() {
 System::System() : movie{*this}, cheat_engine{*this} {}
 
 System::~System() = default;
+
+namespace {
+// Per-host-thread "currently running ARM11 core" pointer. Set by
+// RunCoreSlice on whichever host thread is dispatching a core's
+// Run()/Step(), cleared at slice end. Reads via System::
+// GetRunningCore(): if this is non-null, the caller is on a thread
+// that is mid-dispatch, so the thread-local wins; otherwise we fall
+// back to the legacy single-pointer member (used by paths outside the
+// dispatch loop, e.g. SaveContext on shutdown).
+//
+// Foundation for moving Core 1 onto a worker host thread: each
+// thread sets its own tls before invoking dynarmic, and SVC handlers
+// reading System::GetRunningCore() automatically see the right core
+// without any caller changes.
+thread_local Core::ARM_Interface* tls_running_core = nullptr;
+} // namespace
+
+void System::SetThreadLocalRunningCore(ARM_Interface* core) {
+    tls_running_core = core;
+}
+
+ARM_Interface* System::GetThreadLocalRunningCore() {
+    return tls_running_core;
+}
+
+ARM_Interface& System::GetRunningCore() {
+    if (tls_running_core) [[likely]] {
+        return *tls_running_core;
+    }
+    return *running_core;
+}
+
+void System::Core1WorkerLoop(std::stop_token stop) {
+    // Pin the core1 worker to a specific host CPU and bump its
+    // priority — same trick as the GpuWorker. Without affinity the
+    // Linux scheduler may bounce it across cores and the cpufreq
+    // governor may downclock its core because the worker is bursty.
+    // We pin to CPU 2 (CPU 0/1 are the emu thread's preferred cores
+    // in Android setup; CPU 3 is the GpuWorker's). Failures are
+    // ignored — the worker still works, just with worse pacing.
+#if defined(__linux__) || defined(__ANDROID__)
+    cpu_set_t cpu_set;
+    CPU_ZERO(&cpu_set);
+    CPU_SET(2, &cpu_set);
+    sched_setaffinity(0, sizeof(cpu_set), &cpu_set);
+    setpriority(PRIO_PROCESS, 0, -20);
+#endif
+
+    LOG_INFO(Core_ARM11, "ARM11 Core 1 worker thread started");
+
+    while (!stop.stop_requested()) {
+        // Wait for a slice request.
+        Core1WorkerState observed_state;
+        s64 slice;
+        bool tight_loop;
+        {
+            std::unique_lock lock{core1_worker_mutex};
+            core1_worker_request_cv.wait(lock, [this, &stop] {
+                return core1_worker_state == Core1WorkerState::Requested || stop.stop_requested();
+            });
+            if (stop.stop_requested()) {
+                return;
+            }
+            observed_state = core1_worker_state;
+            slice = core1_worker_slice_request;
+            tight_loop = core1_worker_tight_loop;
+        }
+        if (observed_state != Core1WorkerState::Requested) {
+            continue;
+        }
+
+        // Run Core 1's slice. RunCoreSlice will install the
+        // thread-local running-core pointer for *this* host thread,
+        // so SVC handlers reached from inside dynarmic see Core 1.
+        RunCoreSlice(cpu_cores[1].get(), slice, tight_loop);
+
+        // Signal completion.
+        {
+            std::scoped_lock lock{core1_worker_mutex};
+            core1_worker_state = Core1WorkerState::Done;
+        }
+        core1_worker_done_cv.notify_one();
+    }
+
+    LOG_INFO(Core_ARM11, "ARM11 Core 1 worker thread stopped");
+}
+
+void System::StartCore1Worker() {
+    if (core1_worker) {
+        return;
+    }
+    if (cpu_cores.size() < 2) {
+        LOG_WARNING(Core_ARM11, "Core 1 worker not started (only {} cores)", cpu_cores.size());
+        return;
+    }
+    core1_worker_state = Core1WorkerState::Idle;
+    core1_worker = std::make_unique<std::jthread>(
+        [this](std::stop_token stop) { Core1WorkerLoop(stop); });
+}
+
+void System::StopCore1Worker() {
+    if (!core1_worker) {
+        return;
+    }
+    core1_worker->request_stop();
+    {
+        std::scoped_lock lock{core1_worker_mutex};
+        core1_worker_state = Core1WorkerState::Stop;
+    }
+    core1_worker_request_cv.notify_all();
+    core1_worker_done_cv.notify_all();
+    core1_worker.reset(); // joins
+}
+
+void System::RunCoreSlice(ARM_Interface* core, s64 slice, bool tight_loop) {
+    // Caller is whichever host thread is currently driving this core.
+    // Install the thread-local running-core pointer first so that any
+    // code reached during dynarec execution (SVC handlers, callbacks)
+    // sees THIS core via GetRunningCore() — not whichever core another
+    // host thread happens to be running concurrently.
+    tls_running_core = core;
+    // Mirror to the legacy single-pointer member too. Today, with
+    // both cores dispatched sequentially from the emu thread, this is
+    // a no-op write race against itself; with a Core 1 worker host
+    // thread it would race against Core 0's RunCoreSlice and we will
+    // remove the assignment in iteration 2 (the thread_local will be
+    // the only source of truth).
+    running_core = core;
+    kernel->SetRunningCPU(core);
+
+    core->GetTimer().SetNextSlice(slice);
+    LOG_TRACE(Core_ARM11, "Core {} running for {} ticks", core->GetID(),
+              core->GetTimer().GetDowncount());
+
+    // If we don't have a currently active thread then don't execute
+    // instructions, instead advance to the next event and try to yield
+    // to the next thread.
+    if (kernel->GetCurrentThreadManager().GetCurrentThread() == nullptr) {
+        LOG_TRACE(Core_ARM11, "Core {} idling", core->GetID());
+        core->GetTimer().Idle();
+        PrepareReschedule();
+    } else {
+        if (tight_loop) {
+            core->Run();
+        } else {
+            core->Step();
+        }
+    }
+}
 
 System::ResultStatus System::RunLoop(bool tight_loop) {
     status = ResultStatus::Success;
@@ -241,9 +397,9 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             }
         }
     } else {
-        // Now all cores are at the same global time. So we will run them one after the other
-        // with a max slice that is the minimum of all max slices of all cores
-        // TODO: Make special check for idle since we can easily revert the time of idle cores
+        // Now all cores are at the same global time. We dispatch them
+        // in parallel: emu thread runs Core 0, core1_worker host
+        // thread runs Core 1.
         s64 max_slice = Timing::MAX_SLICE_LENGTH;
         for (const auto& cpu_core : cpu_cores) {
             running_core = cpu_core.get();
@@ -253,28 +409,46 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             kernel->GetThreadManager(cpu_core->GetID()).Reschedule();
             max_slice = std::min(max_slice, cpu_core->GetTimer().GetMaxSliceLength());
         }
-        for (auto& cpu_core : cpu_cores) {
-            cpu_core->GetTimer().SetNextSlice(max_slice);
-            auto start_ticks = cpu_core->GetTimer().GetTicks();
-            LOG_TRACE(Core_ARM11, "Core {} running for {} ticks", cpu_core->GetID(),
-                      cpu_core->GetTimer().GetDowncount());
-            running_core = cpu_core.get();
-            kernel->SetRunningCPU(running_core);
-            // If we don't have a currently active thread then don't execute instructions,
-            // instead advance to the next event and try to yield to the next thread
-            if (kernel->GetCurrentThreadManager().GetCurrentThread() == nullptr) {
-                LOG_TRACE(Core_ARM11, "Core {} idling", cpu_core->GetID());
-                cpu_core->GetTimer().Idle();
-                PrepareReschedule();
-            } else {
-                if (tight_loop) {
-                    cpu_core->Run();
-                } else {
-                    cpu_core->Step();
-                }
-            }
-            max_slice = cpu_core->GetTimer().GetTicks() - start_ticks;
+
+        // Hand off Core 1 to its worker host thread (if available
+        // and we have 2 cores). Both cores then run in parallel.
+        const bool use_worker = core1_worker && cpu_cores.size() >= 2;
+        if (use_worker) {
+            std::scoped_lock lock{core1_worker_mutex};
+            core1_worker_slice_request = max_slice;
+            core1_worker_tight_loop = tight_loop;
+            core1_worker_state = Core1WorkerState::Requested;
+            core1_worker_request_cv.notify_one();
         }
+
+        // Run Core 0 on the emu thread, in parallel with the worker
+        // running Core 1 (if use_worker).
+        RunCoreSlice(cpu_cores[0].get(), max_slice, tight_loop);
+
+        if (use_worker) {
+            // Wait for the Core 1 worker to finish its slice. The
+            // wait is on a condvar, not a spin — both threads
+            // released the kernel hle_lock by this point so any SVC
+            // handler racing the worker has had a chance to make
+            // progress.
+            std::unique_lock lock{core1_worker_mutex};
+            core1_worker_done_cv.wait(lock, [this] {
+                return core1_worker_state == Core1WorkerState::Done ||
+                       core1_worker_state == Core1WorkerState::Stop;
+            });
+            if (core1_worker_state == Core1WorkerState::Done) {
+                core1_worker_state = Core1WorkerState::Idle;
+            }
+        } else if (cpu_cores.size() >= 2) {
+            // Fallback: no worker thread, run Core 1 sequentially on
+            // the emu thread (mirrors pre-2B behavior).
+            RunCoreSlice(cpu_cores[1].get(), max_slice, tight_loop);
+        }
+
+        // Clear the thread-local running-core pointer so any
+        // post-loop code (Reschedule, GDBStub) that calls
+        // GetRunningCore() falls back to the legacy member.
+        tls_running_core = nullptr;
     }
 
     if (GDBStub::IsServerEnabled()) {
@@ -485,7 +659,18 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
 }
 
 void System::PrepareReschedule() {
-    running_core->PrepareReschedule();
+    // Halt whichever core the *calling* host thread is running. With
+    // a future Core 1 worker host thread this will be Core 1 from the
+    // worker's path and Core 0 from the emu thread; today (single
+    // host thread, sequential dispatch) it's whichever core was most
+    // recently set in tls_running_core. Falling back to the legacy
+    // member covers paths that call PrepareReschedule from outside a
+    // RunCoreSlice (e.g. early system init or shutdown) where the
+    // thread-local hasn't been set.
+    auto* core = tls_running_core ? tls_running_core : running_core;
+    if (core) {
+        core->PrepareReschedule();
+    }
     reschedule_pending = true;
 }
 
@@ -553,6 +738,11 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
 
     kernel->SetCPUs(cpu_cores);
     kernel->SetRunningCPU(cpu_cores[0].get());
+
+    // Spawn the Core 1 worker host thread now that cpu_cores is
+    // populated. From this point on, RunLoop dispatches Core 0 on
+    // the emu thread and Core 1 on this worker in parallel.
+    StartCore1Worker();
 
     const auto audio_emulation = Settings::values.audio_emulation.GetValue();
     if (audio_emulation == Settings::AudioEmulation::HLE) {
@@ -697,6 +887,11 @@ void System::Shutdown(bool is_deserializing) {
 
     // Shutdown emulation session
     is_powered_on = false;
+
+    // Stop the Core 1 worker BEFORE tearing down kernel/cpu_cores —
+    // the worker holds raw pointers into cpu_cores via RunCoreSlice,
+    // so it must be joined while those pointers are still valid.
+    StopCore1Worker();
 
     gpu.reset();
     if (!is_deserializing) {

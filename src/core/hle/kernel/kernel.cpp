@@ -59,6 +59,13 @@ const ResourceLimitList& KernelSystem::ResourceLimit() const {
     return *resource_limits;
 }
 
+// Definition for the static thread_local member declared in kernel.h.
+// Each host thread that enters the kernel sees its own value, set by
+// SetRunningCPU on entry. Defaults to nullptr; the dispatch loop in
+// System::RunLoop / RunCoreSlice always sets it before invoking the
+// dynarec.
+thread_local Core::ARM_Interface* KernelSystem::current_cpu = nullptr;
+
 u32 KernelSystem::GenerateObjectID() {
     return next_object_id++;
 }
@@ -107,16 +114,29 @@ void KernelSystem::SetCPUs(std::vector<std::shared_ptr<Core::ARM_Interface>> cpu
 }
 
 void KernelSystem::SetRunningCPU(Core::ARM_Interface* cpu) {
-    // Hot path: called 4-5x per RunLoop iteration (twice per core in
-    // both the synced and catch-up loops). The shared_ptr write into
-    // stored_processes[] is the costliest piece — it's an atomic
-    // refcount swap on every call. Skip the swap when we're switching
-    // back to the same CPU (no-op switch) and skip the SetCurrentProcess
-    // cascade by relying on its own equality early-return.
-    if (current_cpu == cpu) [[unlikely]] {
+    // Hot path: called per slice from RunCoreSlice. With dual host
+    // threads (emu thread for Core 0, core1_worker for Core 1) this
+    // is now called concurrently from two threads. The early-return
+    // makes the steady-state cost zero — current_cpu is thread_local
+    // so each thread tracks "its" CPU independently and the early
+    // return fires on every subsequent call after the very first.
+    if (current_cpu == cpu) [[likely]] {
         return;
     }
-    if (current_process) {
+
+    // First-time entry on this host thread (or rare process switch).
+    // Take hle_lock for the actual mutation: stored_processes[],
+    // current_process, timing.SetCurrentTimer all touch shared
+    // KernelSystem state and would race the OTHER host thread's
+    // SetRunningCPU first-time path. hle_lock is recursive so this
+    // is safe even if a SVC handler chain re-enters here.
+    std::scoped_lock lock{hle_lock};
+
+    // current_cpu is thread_local now, so on the very first call
+    // from a new host thread (e.g. the Core 1 worker on its first
+    // slice) it's nullptr — there's no "previous CPU" to stash the
+    // current process for. Skip the stash in that case.
+    if (current_cpu != nullptr && current_process) {
         stored_processes[current_cpu->GetID()] = current_process;
     }
     current_cpu = cpu;
