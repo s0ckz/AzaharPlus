@@ -999,7 +999,15 @@ void MemorySystem::RasterizerMarkRegionCached(PAddr start, u32 size, bool cached
                         break;
                     case PageType::Memory:
                         page_type = PageType::RasterizerCachedMemory;
-                        page_table->pointers[vaddr >> CITRA_PAGE_BITS] = nullptr;
+                        std::atomic_thread_fence(std::memory_order_release);
+                        page_table->pointers[idx] = nullptr;
+                        // Also unmap from the fastmem reservation so
+                        // the JIT faults on this page and falls back to
+                        // the callback path, which handles the
+                        // rasterizer flush. Without this, the fastmem
+                        // load succeeds and returns stale data
+                        // (bypassing the flush the callback would do).
+                        impl->FastmemUnmap(static_cast<u32>(idx));
                         break;
                     default:
                         UNREACHABLE();
@@ -1012,9 +1020,14 @@ void MemorySystem::RasterizerMarkRegionCached(PAddr start, u32 size, bool cached
                         // address space, for example, a system module need not have a VRAM mapping.
                         break;
                     case PageType::RasterizerCachedMemory: {
+                        auto ptr = GetPointerForRasterizerCache(vaddr & ~CITRA_PAGE_MASK);
+                        page_table->pointers[idx] = ptr;
+                        std::atomic_thread_fence(std::memory_order_release);
                         page_type = PageType::Memory;
-                        page_table->pointers[vaddr >> CITRA_PAGE_BITS] =
-                            GetPointerForRasterizerCache(vaddr & ~CITRA_PAGE_MASK);
+                        // Re-establish the fastmem mapping now that
+                        // the page is back to normal Memory type.
+                        impl->FastmemMapPtr(static_cast<u32>(idx),
+                                            static_cast<u8*>(page_table->pointers[idx]));
                         break;
                     }
                     default:
