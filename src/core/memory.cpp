@@ -1040,6 +1040,13 @@ void MemorySystem::RasterizerMarkRegionCached(PAddr start, u32 size, bool cached
                         page_type = PageType::RasterizerCachedMemory;
                         std::atomic_thread_fence(std::memory_order_release);
                         page_table->pointers[idx] = nullptr;
+                        // Also unmap from the fastmem reservation so
+                        // the JIT faults on this page and falls back to
+                        // the callback path, which handles the
+                        // rasterizer flush. Without this, the fastmem
+                        // load succeeds and returns stale data
+                        // (bypassing the flush the callback would do).
+                        impl->FastmemUnmap(static_cast<u32>(idx));
                         break;
                     default:
                         UNREACHABLE();
@@ -1054,10 +1061,14 @@ void MemorySystem::RasterizerMarkRegionCached(PAddr start, u32 size, bool cached
                     case PageType::Unmapped:
                         break;
                     case PageType::RasterizerCachedMemory: {
-                        page_table->pointers[idx] =
-                            GetPointerForRasterizerCache(vaddr & ~CITRA_PAGE_MASK);
+                        auto ptr = GetPointerForRasterizerCache(vaddr & ~CITRA_PAGE_MASK);
+                        page_table->pointers[idx] = ptr;
                         std::atomic_thread_fence(std::memory_order_release);
                         page_type = PageType::Memory;
+                        // Re-establish the fastmem mapping now that
+                        // the page is back to normal Memory type.
+                        impl->FastmemMapPtr(static_cast<u32>(idx),
+                                            static_cast<u8*>(page_table->pointers[idx]));
                         break;
                     }
                     default:
