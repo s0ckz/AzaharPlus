@@ -1525,11 +1525,16 @@ void RasterizerCache<T>::UnregisterSurface(SurfaceId surface_id) {
 
     if (surface.type != SurfaceType::Fill) {
         RemoveTextureCubeFace(surface_id);
-        sentenced.emplace_back(surface_id, frame_tick);
-        return;
     }
-
-    slot_surfaces.erase(surface_id);
+    // ALL surface types are sentenced — including Fill surfaces.
+    // The original code immediately erased Fill surfaces, but with
+    // the GpuWorker architecture a Fill surface's VkImage can still
+    // be referenced by an in-flight command chunk in the Vulkan
+    // scheduler's work queue. Destroying it immediately causes a
+    // SIGSEGV in the VulkanWorker (WorkerThread+748, fault at 0x60
+    // in libGLES_mali.so). Sentencing defers destruction until
+    // RunGarbageCollector calls WaitWorker to drain the pipeline.
+    sentenced.emplace_back(surface_id, frame_tick);
 }
 
 template <class T>
