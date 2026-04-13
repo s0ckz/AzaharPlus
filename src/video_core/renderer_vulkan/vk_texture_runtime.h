@@ -44,7 +44,8 @@ enum ViewType {
 };
 
 struct Handle {
-    explicit Handle(const Instance& _instance) : instance(_instance) {}
+    explicit Handle(const Instance& _instance, Scheduler* _scheduler = nullptr)
+        : instance(_instance), scheduler(_scheduler) {}
 
     ~Handle() {
         Destroy();
@@ -53,7 +54,8 @@ struct Handle {
     Handle(const Handle& other) = delete;
 
     Handle(Handle&& other) noexcept
-        : instance(other.instance), allocation(std::exchange(other.allocation, VK_NULL_HANDLE)),
+        : instance(other.instance), scheduler(other.scheduler),
+          allocation(std::exchange(other.allocation, VK_NULL_HANDLE)),
           image(std::exchange(other.image, VK_NULL_HANDLE)),
           image_views(std::exchange(other.image_views, {})),
           framebuffer(std::exchange(other.framebuffer, VK_NULL_HANDLE)),
@@ -89,6 +91,9 @@ struct Handle {
     }
 
     const Instance& instance;
+    Scheduler* scheduler{nullptr}; // When non-null, Vulkan creation APIs
+                                   // proxy through Record+WaitWorker to
+                                   // run on the VulkanWorker thread.
 
     VmaAllocation allocation{VK_NULL_HANDLE};
     vk::Image image{VK_NULL_HANDLE};

@@ -107,6 +107,10 @@ void GpuWorker::Flush() {
 void GpuWorker::Loop(std::stop_token stop) {
     t_on_worker_thread = true;
 
+    // Force the Mali G52 driver to set up per-thread TLS for this
+    // thread before any Vulkan objects are created on it.
+    gpu_owner->InitGpuWorkerThread();
+
     while (!stop.stop_requested()) {
         GpuMessage msg;
         {

@@ -210,17 +210,8 @@ void Handle::Create(u32 width, u32 height, u32 levels, TextureType type, vk::For
     VkImage unsafe_image{};
     VkImageCreateInfo unsafe_image_info = static_cast<VkImageCreateInfo>(image_info);
 
-    VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
-                                     &unsafe_image, &allocation, nullptr);
-    if (result != VK_SUCCESS) [[unlikely]] {
-        LOG_CRITICAL(Render_Vulkan, "Failed allocating image with error {}", result);
-        UNREACHABLE();
-    }
-
-    image = vk::Image{unsafe_image};
-
     const vk::ImageViewCreateInfo view_info = {
-        .image = image,
+        .image = {}, // filled after vmaCreateImage
         .viewType = is_cube_map ? vk::ImageViewType::eCube : vk::ImageViewType::e2D,
         .format = format,
         .subresourceRange{
@@ -231,7 +222,34 @@ void Handle::Create(u32 width, u32 height, u32 levels, TextureType type, vk::For
             .layerCount = VK_REMAINING_ARRAY_LAYERS,
         },
     };
-    image_views[ViewType::Sample] = instance.GetDevice().createImageView(view_info);
+
+    // The Mali G52 driver has per-thread internal state (TLS).
+    // Vulkan objects created on the GpuWorker thread and used on the
+    // VulkanWorker thread cause a null deref at driver offset 0x60.
+    // Proxy creation through the VulkanWorker via Record+WaitWorker
+    // so all Vulkan objects are created on the SAME thread that will
+    // use them in command buffers.
+    const auto do_create = [&] {
+        VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info,
+                                         &alloc_info, &unsafe_image, &allocation, nullptr);
+        if (result != VK_SUCCESS) [[unlikely]] {
+            LOG_CRITICAL(Render_Vulkan, "Failed allocating image with error {}", result);
+            UNREACHABLE();
+        }
+        image = vk::Image{unsafe_image};
+
+        auto fixed_view_info = view_info;
+        fixed_view_info.image = image;
+        image_views[ViewType::Sample] = instance.GetDevice().createImageView(fixed_view_info);
+    };
+
+    if (scheduler) {
+        scheduler->Record([&do_create](auto) { do_create(); });
+        scheduler->WaitWorker();
+    } else {
+        do_create();
+    }
+
     if (levels == 1) {
         image_views[ViewType::Mip0] = image_views[ViewType::Mip0];
     }
@@ -755,7 +773,8 @@ bool TextureRuntime::NeedsConversion(VideoCore::PixelFormat format) const {
 Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceParams& params)
     : SurfaceBase{params}, runtime{runtime_}, instance{runtime_.GetInstance()},
       scheduler{runtime_.GetScheduler()}, traits{instance.GetTraits(pixel_format)},
-      handles{Handle(instance), Handle(instance), Handle(instance), Handle(instance)} {
+      handles{Handle(instance, &scheduler), Handle(instance, &scheduler),
+             Handle(instance, &scheduler), Handle(instance, &scheduler)} {
 
     if (pixel_format == VideoCore::PixelFormat::Invalid || !traits.transfer_support) {
         return;
@@ -814,7 +833,8 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceBase& surface
                  const VideoCore::Material* mat)
     : SurfaceBase{surface}, runtime{runtime_}, instance{runtime_.GetInstance()},
       scheduler{runtime_.GetScheduler()}, traits{instance.GetTraits(mat->format)},
-      handles{Handle(instance), Handle(instance), Handle(instance), Handle(instance)} {
+      handles{Handle(instance, &scheduler), Handle(instance, &scheduler),
+             Handle(instance, &scheduler), Handle(instance, &scheduler)} {
     if (!traits.transfer_support) {
         return;
     }
@@ -1326,7 +1346,15 @@ vk::ImageView Surface::ImageView(ViewType view_type, Type type) noexcept {
             .layerCount = VK_REMAINING_ARRAY_LAYERS,
         },
     };
-    handle.image_views[view_type] = instance.GetDevice().createImageView(view_info);
+    // Proxy through VulkanWorker for Mali G52 thread-affinity fix.
+    if (handle.scheduler) {
+        handle.scheduler->Record([&](auto) {
+            handle.image_views[view_type] = instance.GetDevice().createImageView(view_info);
+        });
+        handle.scheduler->WaitWorker();
+    } else {
+        handle.image_views[view_type] = instance.GetDevice().createImageView(view_info);
+    }
     return handle.image_views[view_type];
 }
 
@@ -1350,7 +1378,15 @@ vk::Framebuffer Surface::Framebuffer(Type type) noexcept {
         .height = handle.height,
         .layers = handle.layers,
     };
-    handle.framebuffer = instance.GetDevice().createFramebuffer(framebuffer_info);
+    // Proxy through VulkanWorker for Mali G52 thread-affinity fix.
+    if (handle.scheduler) {
+        handle.scheduler->Record([&](auto) {
+            handle.framebuffer = instance.GetDevice().createFramebuffer(framebuffer_info);
+        });
+        handle.scheduler->WaitWorker();
+    } else {
+        handle.framebuffer = instance.GetDevice().createFramebuffer(framebuffer_info);
+    }
     return handle.framebuffer;
 }
 

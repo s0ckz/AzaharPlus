@@ -119,6 +119,10 @@ public:
     // work that used to run synchronously on the emu thread. Not intended
     // to be called from outside the worker loop — the non-OnWorker public
     // methods above are the producer entry points from the emu thread.
+    /// Called once from the GpuWorker thread at startup to force the
+    /// Mali G52 driver to initialize per-thread TLS for this thread.
+    void InitGpuWorkerThread();
+
     void ExecuteOnWorker(const Service::GSP::Command& command);
     void VBlankOnWorker(s64 cycles_late);
     void SetBufferSwapOnWorker(u32 screen_id, const Service::GSP::FrameBufferInfo& info);

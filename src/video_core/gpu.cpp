@@ -238,6 +238,25 @@ void GPU::Execute(const Service::GSP::Command& command) {
     ExecuteOnWorker(command);
 }
 
+void GPU::InitGpuWorkerThread() {
+    // Force the Mali G52 Vulkan driver to initialize its per-thread
+    // internal state (TLS) for the GpuWorker thread. The VkDevice was
+    // created on the emu thread; calling any device-level Vulkan API
+    // from a new thread causes the driver to set up TLS for that
+    // thread. Without this, Vulkan objects created on the GpuWorker
+    // (VkImage, VkImageView, VkPipeline) have null internal driver
+    // references when used on the VulkanWorker → SIGSEGV at offset
+    // 0x60 or silent deadlock.
+    //
+    // TickFrame makes lightweight Vulkan calls (descriptor pool
+    // queries, fence checks) that are enough to trigger Mali's
+    // per-thread TLS setup.
+    if (impl->rasterizer) {
+        impl->rasterizer->FlushAll();
+    }
+    LOG_INFO(HW_GPU, "GpuWorker thread Vulkan TLS initialized");
+}
+
 void GPU::ExecuteOnWorker(const Service::GSP::Command& command) {
     using Service::GSP::CommandId;
     auto& regs = impl->pica.regs;
