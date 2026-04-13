@@ -230,7 +230,13 @@ vk::UniqueRenderPass RenderManager::CreateRenderPass(vk::Format color, vk::Forma
         .pDependencies = nullptr,
     };
 
-    return instance.GetDevice().createRenderPassUnique(renderpass_info);
+    // Proxy through VulkanWorker for Mali G52 thread-affinity fix.
+    vk::UniqueRenderPass result;
+    scheduler.Record([&](auto) {
+        result = instance.GetDevice().createRenderPassUnique(renderpass_info);
+    });
+    scheduler.WaitWorker();
+    return result;
 }
 
 } // namespace Vulkan

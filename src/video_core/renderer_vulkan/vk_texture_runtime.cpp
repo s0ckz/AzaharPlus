@@ -1548,7 +1548,11 @@ Framebuffer::Framebuffer(TextureRuntime& runtime, const VideoCore::FramebufferPa
         .height = height,
         .layers = 1,
     };
-    framebuffer = instance.GetDevice().createFramebuffer(framebuffer_info);
+    // Proxy through VulkanWorker for Mali G52 thread-affinity fix.
+    runtime.GetScheduler().Record([&](auto) {
+        framebuffer = instance.GetDevice().createFramebuffer(framebuffer_info);
+    });
+    runtime.GetScheduler().WaitWorker();
 }
 
 Framebuffer::~Framebuffer() {
@@ -1598,7 +1602,12 @@ Sampler::Sampler(TextureRuntime& runtime, const VideoCore::SamplerParams& params
             use_border_color ? vk::BorderColor::eFloatCustomEXT : vk::BorderColor::eIntOpaqueBlack,
         .unnormalizedCoordinates = false,
     };
-    sampler = instance.GetDevice().createSamplerUnique(sampler_info);
+    // Proxy through VulkanWorker for Mali G52 thread-affinity fix.
+    auto& sched = runtime.GetScheduler();
+    sched.Record([&](auto) {
+        sampler = instance.GetDevice().createSamplerUnique(sampler_info);
+    });
+    sched.WaitWorker();
 }
 
 Sampler::~Sampler() = default;

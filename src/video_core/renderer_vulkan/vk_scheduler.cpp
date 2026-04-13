@@ -109,7 +109,9 @@ void Scheduler::DispatchWorkLocked() {
         return;
     }
 
-    on_dispatch();
+    if (on_dispatch) {
+        on_dispatch();
+    }
 
     {
         std::scoped_lock ql{queue_mutex};
@@ -152,6 +154,15 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // the queue lock goes out of scope. This allows us to force execution
             // to complete in the next step.
             std::exchange(lk, std::unique_lock{execution_mutex});
+
+            // Flush pending descriptor updates on THIS thread (VulkanWorker)
+            // before executing the chunk's commands. This ensures
+            // vkUpdateDescriptorSets runs on the same thread as the
+            // vkCmd* calls that reference those descriptors — required
+            // for Mali G52 driver thread-affinity.
+            if (pre_execute) {
+                pre_execute();
+            }
 
             // Perform the work, tracking whether the chunk was a submission
             // before executing.

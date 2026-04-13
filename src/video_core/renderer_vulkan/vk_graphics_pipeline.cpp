@@ -10,6 +10,7 @@
 #include "video_core/renderer_vulkan/pica_to_vk.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_render_manager.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -75,9 +76,10 @@ Shader::~Shader() {
 GraphicsPipeline::GraphicsPipeline(const Instance& instance_, RenderManager& renderpass_cache_,
                                    const PipelineInfo& info_, vk::PipelineCache pipeline_cache_,
                                    vk::PipelineLayout layout_, std::array<Shader*, 3> stages_,
-                                   Common::ThreadWorker* worker_)
+                                   Common::ThreadWorker* worker_, Scheduler* scheduler_)
     : instance{instance_}, renderpass_cache{renderpass_cache_}, worker{worker_},
-      pipeline_layout{layout_}, pipeline_cache{pipeline_cache_}, info{info_}, stages{stages_} {}
+      scheduler{scheduler_}, pipeline_layout{layout_}, pipeline_cache{pipeline_cache_},
+      info{info_}, stages{stages_} {}
 
 GraphicsPipeline::~GraphicsPipeline() = default;
 
@@ -282,10 +284,28 @@ bool GraphicsPipeline::Build(bool fail_on_compile_required) {
         pipeline_info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequiredEXT;
     }
 
-    auto result = instance.GetDevice().createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
-    if (result.result == vk::Result::eSuccess) {
-        pipeline = std::move(result.value);
-    } else if (result.result == vk::Result::eErrorPipelineCompileRequiredEXT) {
+    // Proxy pipeline creation through VulkanWorker for Mali G52
+    // thread-affinity fix. Pipelines created on the GpuWorker thread
+    // crash when bound on the VulkanWorker thread.
+    const auto do_create = [&]() -> vk::Result {
+        auto result = instance.GetDevice().createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+        if (result.result == vk::Result::eSuccess) {
+            pipeline = std::move(result.value);
+        }
+        return result.result;
+    };
+
+    vk::Result create_result;
+    if (scheduler) {
+        scheduler->Record([&](auto) { create_result = do_create(); });
+        scheduler->WaitWorker();
+    } else {
+        create_result = do_create();
+    }
+
+    if (create_result == vk::Result::eSuccess) {
+        // pipeline already set inside do_create
+    } else if (create_result == vk::Result::eErrorPipelineCompileRequiredEXT) {
         return false;
     } else {
         UNREACHABLE_MSG("Graphics pipeline creation failed!");

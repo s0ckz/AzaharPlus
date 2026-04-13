@@ -11,6 +11,10 @@
 #include "video_core/rasterizer_cache/pixel_format.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
+namespace Vulkan {
+class Scheduler;
+} // namespace Vulkan
+
 #define LAYOUT_HASH static_cast<u64>(sizeof(T)), static_cast<u64>(alignof(T))
 #define FIELD_HASH(x) static_cast<u64>(offsetof(T, x)), static_cast<u64>(sizeof(x))
 
@@ -315,7 +319,8 @@ public:
     explicit GraphicsPipeline(const Instance& instance, RenderManager& renderpass_cache,
                               const PipelineInfo& info, vk::PipelineCache pipeline_cache,
                               vk::PipelineLayout layout, std::array<Shader*, 3> stages,
-                              Common::ThreadWorker* worker);
+                              Common::ThreadWorker* worker,
+                              Scheduler* scheduler = nullptr);
     ~GraphicsPipeline();
 
     bool TryBuild(bool wait_built);
@@ -330,6 +335,7 @@ private:
     const Instance& instance;
     RenderManager& renderpass_cache;
     Common::ThreadWorker* worker;
+    Scheduler* scheduler{nullptr};
 
     vk::UniquePipeline pipeline;
     vk::PipelineLayout pipeline_layout;

@@ -92,6 +92,14 @@ public:
         on_dispatch = std::move(func);
     }
 
+    /// Registers a callback to perform on the VulkanWorker thread
+    /// BEFORE each chunk is executed. Used to run vkUpdateDescriptorSets
+    /// on the worker thread instead of the GpuWorker thread (Mali G52
+    /// thread-affinity workaround).
+    void RegisterPreExecute(std::function<void()>&& func) {
+        pre_execute = std::move(func);
+    }
+
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
         return master_semaphore->CurrentTick();
@@ -216,6 +224,7 @@ private:
     StateFlags state{};
     std::function<void()> on_submit;
     std::function<void()> on_dispatch;
+    std::function<void()> pre_execute;
     std::mutex execution_mutex;
     std::mutex reserve_mutex;
     std::mutex queue_mutex;
