@@ -1525,16 +1525,21 @@ void RasterizerCache<T>::UnregisterSurface(SurfaceId surface_id) {
 
     if (surface.type != SurfaceType::Fill) {
         RemoveTextureCubeFace(surface_id);
+        sentenced.emplace_back(surface_id, frame_tick);
+        return;
     }
-    // ALL surface types are sentenced — including Fill surfaces.
-    // The original code immediately erased Fill surfaces, but with
-    // the GpuWorker architecture a Fill surface's VkImage can still
-    // be referenced by an in-flight command chunk in the Vulkan
-    // scheduler's work queue. Destroying it immediately causes a
-    // SIGSEGV in the VulkanWorker (WorkerThread+748, fault at 0x60
-    // in libGLES_mali.so). Sentencing defers destruction until
-    // RunGarbageCollector calls WaitWorker to drain the pipeline.
-    sentenced.emplace_back(surface_id, frame_tick);
+
+    // Fill surfaces are high-frequency (created+destroyed every color
+    // fill op). Sentencing them with the normal RemoveThreshold bloats
+    // the list and triggers WaitWorker 60x/sec → kills fps. Instead,
+    // sentence with an adjusted tick so they expire after ~4 frames
+    // (enough for the Vulkan pipeline to consume any chunk that
+    // captured their VkImage handle). RunGarbageCollector's WaitWorker
+    // ensures the handle is safe before the actual destruction.
+    const u64 short_sentence = runtime.RemoveThreshold() > 4
+                                   ? runtime.RemoveThreshold() - 4
+                                   : 0;
+    sentenced.emplace_back(surface_id, frame_tick - short_sentence);
 }
 
 template <class T>
