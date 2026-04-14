@@ -210,17 +210,8 @@ void Handle::Create(u32 width, u32 height, u32 levels, TextureType type, vk::For
     VkImage unsafe_image{};
     VkImageCreateInfo unsafe_image_info = static_cast<VkImageCreateInfo>(image_info);
 
-    VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
-                                     &unsafe_image, &allocation, nullptr);
-    if (result != VK_SUCCESS) [[unlikely]] {
-        LOG_CRITICAL(Render_Vulkan, "Failed allocating image with error {}", result);
-        UNREACHABLE();
-    }
-
-    image = vk::Image{unsafe_image};
-
     const vk::ImageViewCreateInfo view_info = {
-        .image = image,
+        .image = {},
         .viewType = is_cube_map ? vk::ImageViewType::eCube : vk::ImageViewType::e2D,
         .format = format,
         .subresourceRange{
@@ -231,7 +222,26 @@ void Handle::Create(u32 width, u32 height, u32 levels, TextureType type, vk::For
             .layerCount = VK_REMAINING_ARRAY_LAYERS,
         },
     };
-    image_views[ViewType::Sample] = instance.GetDevice().createImageView(view_info);
+
+    const auto do_create = [&] {
+        VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info,
+                                         &alloc_info, &unsafe_image, &allocation, nullptr);
+        if (result != VK_SUCCESS) [[unlikely]] {
+            LOG_CRITICAL(Render_Vulkan, "Failed allocating image with error {}", result);
+            UNREACHABLE();
+        }
+        image = vk::Image{unsafe_image};
+        auto fixed_view_info = view_info;
+        fixed_view_info.image = image;
+        image_views[ViewType::Sample] = instance.GetDevice().createImageView(fixed_view_info);
+    };
+
+    if (scheduler) {
+        scheduler->Record([&do_create](auto) { do_create(); });
+        scheduler->WaitWorker();
+    } else {
+        do_create();
+    }
     if (levels == 1) {
         image_views[ViewType::Mip0] = image_views[ViewType::Mip0];
     }
@@ -746,7 +756,8 @@ bool TextureRuntime::NeedsConversion(VideoCore::PixelFormat format) const {
 Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceParams& params)
     : SurfaceBase{params}, runtime{runtime_}, instance{runtime_.GetInstance()},
       scheduler{runtime_.GetScheduler()}, traits{instance.GetTraits(pixel_format)},
-      handles{Handle(instance), Handle(instance), Handle(instance), Handle(instance)} {
+      handles{Handle(instance, &scheduler), Handle(instance, &scheduler),
+              Handle(instance, &scheduler), Handle(instance, &scheduler)} {
 
     if (pixel_format == VideoCore::PixelFormat::Invalid || !traits.transfer_support) {
         return;
@@ -805,7 +816,8 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceBase& surface
                  const VideoCore::Material* mat)
     : SurfaceBase{surface}, runtime{runtime_}, instance{runtime_.GetInstance()},
       scheduler{runtime_.GetScheduler()}, traits{instance.GetTraits(mat->format)},
-      handles{Handle(instance), Handle(instance), Handle(instance), Handle(instance)} {
+      handles{Handle(instance, &scheduler), Handle(instance, &scheduler),
+              Handle(instance, &scheduler), Handle(instance, &scheduler)} {
     if (!traits.transfer_support) {
         return;
     }

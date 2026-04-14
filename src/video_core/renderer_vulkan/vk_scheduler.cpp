@@ -109,7 +109,9 @@ void Scheduler::DispatchWorkLocked() {
         return;
     }
 
-    on_dispatch();
+    if (on_dispatch) {
+        on_dispatch();
+    }
 
     {
         std::scoped_lock ql{queue_mutex};
