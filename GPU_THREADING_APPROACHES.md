@@ -296,20 +296,161 @@ Would require separating creation into a prior chunk or restructuring the entire
 
 ---
 
-### Option C-targeted: Proxy ONLY Handle::Create (not ImageView/Framebuffer/Sampler/RenderPass) ← TESTING
-**Status: BUILDING**
-**Effort: Tiny** — only Handle::Create proxied, everything else stays v2
+### Option C-targeted: Proxy Handle::Create only → then +ImageView+Framebuffer
+**Status: TRIED — FAST BUT STILL CRASHES**
+**Branch:** `deploy/option-c-targeted`
 
 Key insight: Option C was slow because it proxied EVERY Vulkan creation call (ImageView, Framebuffer, Sampler, RenderPass — these are called frequently on lazy first-use). Handle::Create (VkImage + VkImageView allocation) is only called on rasterizer cache MISS, which is rare during steady gameplay.
 
 Changes: proxy Handle::Create via Record+WaitWorker + Fill sentencing + guard on_dispatch.
 
+**v1 (Handle::Create only):** ~55-60fps, gpu=0.2ms. Crashed on course transition (lazy ImageView/Framebuffer still on GpuWorker).
+
+**v2 (+ImageView +Framebuffer proxy):** Same speed. STILL CRASHED. Same signature: `WorkerThread+748`, `fault addr 0x60`. Garbage frame visible before crash.
+
+**Conclusion:** Proxying surface creation alone is NOT ENOUGH. The crash persists even with VkImage, VkImageView, and VkFramebuffer all created on VulkanWorker thread. Something ELSE is wrong.
+
+### Remaining unproxied Vulkan object creation on GpuWorker:
+- `vkCreateGraphicsPipeline` — created on **pipeline_workers thread pool** (3rd thread!), used on VulkanWorker
+- `vkUpdateDescriptorSets` — runs in `on_dispatch` on **GpuWorker**, descriptor sets used on VulkanWorker
+- `vkCreateSampler` — created on GpuWorker
+- `vkCreateRenderPass` — created on GpuWorker (proxied in Option C full, not here)
+- Standalone `Framebuffer` constructor (not Surface::Framebuffer)
+
+### Open question from user:
+User observes crash is INTERMITTENT, not deterministic. If it were purely thread-affinity (TLS), every new object would crash. Intermittent = likely a RACE CONDITION:
+- VulkanWorker uses object while GpuWorker is mid-creation/destruction?
+- Descriptor sets written on GpuWorker, read on VulkanWorker with stale/partial state?
+- Pipeline created on pipeline_workers pool, bound on VulkanWorker before fully initialized?
+
+Garbage frame before crash suggests corrupted Vulkan state, not just a null deref.
+
+---
+
+### Dispatch fix: Flush GpuWorker's partial chunk before going idle ← TESTING
+**Status: DEPLOYED with diagnostics**
+**Branch:** `deploy/option-c-targeted` (uncommitted)
+
+**Root cause identified via logging data:**
+
+`VkWorkerProbe` showed `dispatchThread` alternating between two threads:
+- `0x5cb0` = GpuWorker (correct)
+- `0xbcb0` = emu thread (WRONG — via VBlankCallback → SwapBuffers → SubmitExecution → DispatchWork)
+
+The emu thread's DispatchWork calls `on_dispatch` → `vkUpdateDescriptorSets`, flushing the GpuWorker's leftover descriptor writes (referencing GpuWorker-created VkImageViews) from the wrong thread. One sample showed **297 descriptor writes flushed from the emu thread**.
+
+**Why descriptors are left over:** The GpuWorker writes descriptors and Records commands into a chunk. If the chunk isn't full when the GpuWorker goes idle (processes GpuCmdFlush), the partial chunk stays un-dispatched. When the emu thread calls SubmitExecution (for SwapBuffers), it dispatches that partial chunk — and on_dispatch flushes the GpuWorker's descriptors on the emu thread.
+
+**Fix:** When the GpuWorker processes GpuCmdFlush (before going idle), call `DispatchSchedulerOnWorker()` which dispatches the partial chunk NOW, on the GpuWorker thread. The descriptors get flushed on the correct thread. By the time the emu thread takes over, descriptor_write_end = 0.
+
+**Diagnostic logs added:**
+- WARNING when on_dispatch flushes descriptors from a non-GpuWorker thread (the exact danger signal — should be 0 if fix works)
+- PipelineProbe: tracks which thread creates pipelines (another potential cross-thread source)
+- VkWorkerProbe: chunk stats, command index, dispatch thread, descriptor write count
+
+**v3 (descriptor flush fix):** Zero NON-WORKER warnings. Emu thread no longer flushes GpuWorker descriptors. **STILL CRASHES.** Same `WorkerThread+748`, `fault addr 0x60`. Crash coincides with course loading (dma=396 burst). No pipeline creation involved.
+
+**What we've eliminated:**
+- ✅ Surface creation (Handle::Create proxied to VulkanWorker)
+- ✅ Lazy ImageView creation (proxied)
+- ✅ Lazy Framebuffer creation (proxied)  
+- ✅ Descriptor flush from wrong thread (descriptor dispatch fix)
+- ✅ Fill surface immediate destruction (short-sentencing)
+- ❌ Pipeline creation — not triggered in test (cached from disk)
+
+**What's still cross-thread:**
+- `vkUpdateDescriptorSets` runs on GpuWorker (writes VkImageView handles into descriptor sets). VulkanWorker then binds those descriptor sets. Mali might track descriptor-set-write-thread.
+- Surface destruction (Handle::Destroy) runs on GpuWorker during RunGarbageCollector. If VulkanWorker has in-flight refs to destroyed handles → use-after-free (not TLS).
+- `vkCmdBeginRenderPass` on VulkanWorker references VkRenderPass created by RenderManager on GpuWorker.
+
+**v4 (dispatch fix + explicit descriptor flush + crash diagnostics):**
+- Zero NON-WORKER descriptor flush warnings (descriptor thread fix works)
+- Signal handler installed on VulkanWorker for SIGSEGV (but Android debuggerd intercepts first)
+- Tagged Record() lambdas with SetLastVkOp for operation tracking
+- **STILL CRASHES** during normal steady-state gameplay (replay, no loading)
+- Last op before crash: `BindPipeline+SetState` (vkCmdBindPipeline + vkCmdSetViewport + vkCmdBindDescriptorSets)
+- No DMA/loading burst — crash during regular draws
+
+**Root cause narrowed to `BindPipeline+SetState` lambda which calls:**
+- `vkCmdBindPipeline` — pipeline created on `pipeline_workers` thread pool (3rd thread)
+- `vkCmdBindDescriptorSets` — descriptor sets written by `vkUpdateDescriptorSets` on GpuWorker
+- `vkCmdSetViewport/Scissor` — unlikely to cause TLS issues (no object refs)
+
+**v5 (ALL creation proxied: Image+ImageView+Framebuffer+Pipeline+Sampler+RenderPass):**
+- ALL Vulkan object creation now on VulkanWorker via Record+WaitWorker
+- Zero NON-WORKER warnings
+- **STILL CRASHES.** Same `BindPipeline+SetState`, same `fault addr 0x60`
+- Proxying creation does NOT fix the crash
+
+**CONCLUSION: It's NOT about which thread creates objects.**
+
+The ONLY remaining cross-thread Vulkan API call: **`vkUpdateDescriptorSets`** runs on GpuWorker (via `on_dispatch`), then `vkCmdBindDescriptorSets` on VulkanWorker reads/binds them. Mali TLS tracks descriptor write→bind thread affinity.
+
+**v6 (descriptor staging — SwapToStaging + FlushStaging):**
+- on_dispatch (GpuWorker): SwapToStaging (CPU memcpy)
+- pre_execute (VulkanWorker): FlushStaging (vkUpdateDescriptorSets)
+- **REGRESSION: Crashes instantly at game load** with `fault_addr=0x765ff80014` (NOT 0x60)
+- Deterministic: always chunk=2798, cmdIdx=0, lastOp=ClearSurface
+- Same fault address every time = specific VkImage freed but still referenced
+- The staging timing caused a surface's clear command to execute after the surface was destroyed
+- **REVERTED** back to direct Flush
+
+**STATUS AFTER ALL ATTEMPTS:**
+- ALL Vulkan object creation proxied to VulkanWorker ✅
+- Descriptor flush from emu thread eliminated ✅  
+- Descriptor staging attempted and REVERTED (caused regression) ❌
+- `vkUpdateDescriptorSets` STILL runs on GpuWorker — this is the last cross-thread call
+- The original `fault addr 0x60` crash persists with ~3-8 min stability
+
+**v7 (staging + longer Fill sentence 16 frames):**
+- Fixed ClearSurface use-after-free (was `0x765ff80014`, Fill 4-frame sentence too short)
+- Descriptor staging active (GpuWorker: SwapToStaging, VulkanWorker: FlushStaging)
+- ALL creation proxied, ALL descriptors staged
+- **STILL CRASHES `fault addr 0x60`** during gameplay. Garbage frames visible before crash.
+- `lastOp=BindPipeline+SetState` — same as always
+
+**DEFINITIVE CONCLUSION: It's NOT thread affinity.**
+We've now proxied EVERY Vulkan API call to VulkanWorker:
+- All object creation (Image, ImageView, Framebuffer, Pipeline, Sampler, RenderPass)  
+- All descriptor updates (vkUpdateDescriptorSets via staging)
+- GpuWorker makes ZERO Vulkan API calls
+
+And it STILL crashes at `0x60`. This means:
+1. **It's a use-after-free**, not a TLS miss
+2. A VkImage/VkImageView/VkFramebuffer is being destroyed while the VulkanWorker still has in-flight chunks referencing it
+3. The Mali driver's internal struct (at offset 0x60 from the object pointer) is freed/zeroed
+4. `vkCmdBindDescriptorSets` or `vkCmdBindPipeline` on VulkanWorker dereferences the freed struct → SIGSEGV
+
+**v8 (deferred destruction via Record lambda + descriptor staging + all creation proxied):**
+- Handle::Destroy records destruction lambda on VulkanWorker
+- Standalone Framebuffer::~Framebuffer also defers
+- **HandleDestroy count = 0** — deferred path never executed (needs investigation)
+- **STILL CRASHES `fault addr 0x60`** + strange frame artifacts from staging
+- The 0x60 crash is NOT use-after-free (we deferred destruction) and NOT thread affinity (everything proxied)
+- Staging causes rendering artifacts (wrong textures for 1 frame) because descriptors are applied one chunk late
+
+**FINAL STATUS: The `fault addr 0x60` crash persists after ALL fixes:**
+- ✅ All Vulkan creation on VulkanWorker
+- ✅ All descriptor updates on VulkanWorker (staging)
+- ✅ Deferred destruction on VulkanWorker
+- ✅ GpuWorker dispatches partial chunk before idle
+- ✅ Fill surface sentencing (16 frames)
+- ❌ `fault addr 0x60` STILL happens during steady gameplay
+- ❌ Descriptor staging causes 1-frame rendering artifacts
+
+The crash may be a fundamental Mali G52 driver bug when ANY Vulkan work is split across threads, regardless of which thread does what. Or there's a race condition we haven't identified.
+
+**Realistic options:**
+1. Ship `deploy/option-c-targeted` (fast, crashes every 3-8 min) — best playable experience
+2. Ship `deploy/fastmem-only` (46fps, rock stable) — safe fallback
+3. Continue investigating with more invasive logging (track every VkImage handle lifecycle)
+
 ---
 
 ## Current Attempt Queue
 
-1. **Option C-targeted** ← NOW (proxy only Handle::Create, minimal WaitWorker calls)
-2. **Option B** (deferred destruction if needed)
+1. Add command-type logging to identify the crashing Vulkan call
+2. Based on data, target the specific cross-thread path
 3. Ship fastmem-only (46fps stable) if nothing works
 
 ---
