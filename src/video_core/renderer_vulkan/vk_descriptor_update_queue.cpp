@@ -11,8 +11,6 @@ DescriptorUpdateQueue::DescriptorUpdateQueue(const Instance& instance, u32 descr
     : device{instance.GetDevice()}, descriptor_write_max{descriptor_write_max_} {
     descriptor_infos = std::make_unique<DescriptorInfoUnion[]>(descriptor_write_max);
     descriptor_writes = std::make_unique<vk::WriteDescriptorSet[]>(descriptor_write_max);
-    staging_infos = std::make_unique<DescriptorInfoUnion[]>(descriptor_write_max);
-    staging_writes = std::make_unique<vk::WriteDescriptorSet[]>(descriptor_write_max);
 }
 
 void DescriptorUpdateQueue::Flush() {
@@ -21,27 +19,6 @@ void DescriptorUpdateQueue::Flush() {
     }
     device.updateDescriptorSets({std::span(descriptor_writes.get(), descriptor_write_end)}, {});
     descriptor_write_end = 0;
-}
-
-void DescriptorUpdateQueue::SwapToStaging() {
-    for (u32 i = 0; i < descriptor_write_end; i++) {
-        if (staging_write_end >= descriptor_write_max) [[unlikely]] break;
-        staging_infos[staging_write_end] = descriptor_infos[i];
-        staging_writes[staging_write_end] = descriptor_writes[i];
-        auto& w = staging_writes[staging_write_end];
-        auto& info = staging_infos[staging_write_end];
-        if (w.pImageInfo) w.pImageInfo = &info.image_info;
-        else if (w.pBufferInfo) w.pBufferInfo = &info.buffer_info;
-        else if (w.pTexelBufferView) w.pTexelBufferView = &info.buffer_view;
-        staging_write_end++;
-    }
-    descriptor_write_end = 0;
-}
-
-void DescriptorUpdateQueue::FlushStaging() {
-    if (staging_write_end == 0) return;
-    device.updateDescriptorSets({std::span(staging_writes.get(), staging_write_end)}, {});
-    staging_write_end = 0;
 }
 
 void DescriptorUpdateQueue::AddStorageImage(vk::DescriptorSet target, u8 binding,

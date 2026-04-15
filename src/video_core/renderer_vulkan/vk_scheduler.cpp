@@ -92,16 +92,10 @@ void Scheduler::WaitWorker() {
 
 void Scheduler::Wait(u64 tick) {
     if (tick >= master_semaphore->CurrentTick()) {
+        // Make sure we are not waiting for the current tick without signalling
         Flush();
     }
-    // Wait on the VulkanWorker to avoid concurrent Mali access.
-    // Record a wait lambda, dispatch it, and block until done.
-    if (use_worker_thread) {
-        Record([this, tick](auto) { master_semaphore->Wait(tick); });
-        WaitWorker();
-    } else {
-        master_semaphore->Wait(tick);
-    }
+    master_semaphore->Wait(tick);
 }
 
 void Scheduler::DispatchWork() {
@@ -115,7 +109,9 @@ void Scheduler::DispatchWorkLocked() {
         return;
     }
 
-    if (on_dispatch) on_dispatch();
+    if (on_dispatch) {
+        on_dispatch();
+    }
 
     {
         std::scoped_lock ql{queue_mutex};
@@ -159,10 +155,6 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // to complete in the next step.
             std::exchange(lk, std::unique_lock{execution_mutex});
 
-            if (pre_execute) {
-                pre_execute();
-            }
-
             // Perform the work, tracking whether the chunk was a submission
             // before executing.
             const bool has_submit = work->HasSubmit();
@@ -202,8 +194,9 @@ void Scheduler::SubmitExecution(vk::Semaphore signal_semaphore, vk::Semaphore wa
         MICROPROFILE_SCOPE(Vulkan_Submit);
         std::scoped_lock lock{submit_mutex};
         master_semaphore->SubmitWork(cmdbuf, wait_semaphore, signal_semaphore, signal_value);
-        master_semaphore->Refresh();
     });
+
+    master_semaphore->Refresh();
 
     if (!use_worker_thread) {
         AllocateWorkerCommandBuffers();

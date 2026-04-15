@@ -1495,14 +1495,11 @@ void RasterizerCache<T>::UnregisterSurface(SurfaceId surface_id) {
     if (surface.type != SurfaceType::Fill) {
         RemoveTextureCubeFace(surface_id);
     }
-    u64 sentence_tick = frame_tick;
-    if (surface.type == SurfaceType::Fill) {
-        const u64 fill_lifetime = 16;
-        const u64 skip = runtime.RemoveThreshold() > fill_lifetime
-                             ? runtime.RemoveThreshold() - fill_lifetime : 0;
-        if (frame_tick >= skip) sentence_tick = frame_tick - skip;
-    }
-    sentenced.emplace_back(surface_id, sentence_tick);
+    const u64 short_sentence = (surface.type == SurfaceType::Fill &&
+                                runtime.RemoveThreshold() > 4)
+                                   ? runtime.RemoveThreshold() - 4
+                                   : 0;
+    sentenced.emplace_back(surface_id, frame_tick - short_sentence);
 }
 
 template <class T>

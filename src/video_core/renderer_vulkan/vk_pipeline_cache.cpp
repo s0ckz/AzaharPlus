@@ -12,7 +12,6 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/loader/loader.h"
-#include "video_core/gpu_worker.h"
 #include "video_core/pica/shader_setup.h"
 #include "video_core/renderer_vulkan/pica_to_vk.h"
 #include "video_core/renderer_vulkan/vk_descriptor_update_queue.h"
@@ -95,14 +94,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
       trivial_vertex_shader{
           instance, vk::ShaderStageFlagBits::eVertex,
           GLSL::GenerateTrivialVertexShader(instance.IsShaderClipDistanceSupported(), true)} {
-    scheduler.RegisterOnDispatch([this] {
-        if (VideoCore::GpuWorker::IsOnWorkerThread()) {
-            update_queue.SwapToStaging();
-        } else {
-            update_queue.Flush();
-        }
-    });
-    scheduler.RegisterPreExecute([this] { update_queue.FlushStaging(); });
+    scheduler.RegisterOnDispatch([this] { update_queue.Flush(); });
     profile = Pica::Shader::Profile{
         .enable_accurate_mul = false,
         .has_separable_shaders = true,

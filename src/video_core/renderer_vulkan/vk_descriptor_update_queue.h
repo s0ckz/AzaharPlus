@@ -28,8 +28,6 @@ public:
     ~DescriptorUpdateQueue() = default;
 
     void Flush();
-    void SwapToStaging();
-    void FlushStaging();
 
     void AddStorageImage(vk::DescriptorSet target, u8 binding, vk::ImageView image_view,
                          vk::ImageLayout image_layout = vk::ImageLayout::eGeneral);
@@ -50,9 +48,6 @@ private:
     std::unique_ptr<DescriptorInfoUnion[]> descriptor_infos;
     std::unique_ptr<vk::WriteDescriptorSet[]> descriptor_writes;
     u32 descriptor_write_end = 0;
-    std::unique_ptr<DescriptorInfoUnion[]> staging_infos;
-    std::unique_ptr<vk::WriteDescriptorSet[]> staging_writes;
-    u32 staging_write_end = 0;
 };
 
 } // namespace Vulkan

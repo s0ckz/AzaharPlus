@@ -476,15 +476,3 @@ Even with emu thread making ZERO Vulkan calls, crash persists. It's between GpuW
 **Root cause:** GpuWorker calls `vkUpdateDescriptorSets` (on_dispatch) WHILE VulkanWorker executes `vkCmd*`. Both inside Mali driver simultaneously. In stable main, recording and execution are sequential (never concurrent inside Mali).
 
 **The ONLY remaining fix:** Move `vkUpdateDescriptorSets` to VulkanWorker via descriptor staging (SwapToStaging on GpuWorker, FlushStaging on VulkanWorker pre_execute). Previously tried (v6) but caused init crash from Fill sentencing underflow — that bug is now fixed. Retry descriptor staging.
-
-### v17 (FINAL FIX) — 2 HOURS STABLE, 100% SPEED, 60FPS
-
-**Changes (6 files, ~60 lines on top of option-c-targeted):**
-1. Descriptor staging: GpuWorker SwapToStaging (no Vulkan), VulkanWorker FlushStaging (pre_execute)
-2. Emu thread flushes directly (3 presentation descriptors — safe, microseconds)
-3. master_semaphore->Refresh() moved into submit lambda (VulkanWorker)
-4. ResourcePool::CommitResource Refresh() skipped — uses cached gpu_tick
-5. Scheduler::Wait() moved to VulkanWorker via Record+WaitWorker
-6. Fill sentencing underflow guard (frame_tick < skip → use frame_tick as-is)
-
-**Result: 2 HOURS at MK7 main menu, zero crashes, 100% speed / 60fps.**
