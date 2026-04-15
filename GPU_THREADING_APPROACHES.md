@@ -462,3 +462,17 @@ The crash may be a fundamental Mali G52 driver bug when ANY Vulkan work is split
 3. **FlushRegion:** Called from emu thread via memory callbacks. Involves Vulkan API calls (Surface::Download → vkCmdCopyImageToBuffer). Must either run on the Vulkan thread or avoid Vulkan calls.
 4. **InvalidateRegion:** Hot path from emu thread. Only cache bookkeeping (no Vulkan calls). Can stay on emu thread.
 5. **SwapBuffers:** Creates/uses presentation Vulkan objects. Currently runs on emu thread after worker.Flush(). Needs to be on the Vulkan thread or use emu-thread-created objects only.
+
+---
+
+### DEFINITIVE ROOT CAUSE (confirmed after v10-v12)
+
+**v10 (priority FlushRegion, no proxy):** Crashed at 3 min.
+**v11 (priority FlushRegion + lightweight Event proxy):** Crashed at 6.5 min.
+**v12 (v11 + VBlank routing = ZERO emu-thread Vulkan):** Crashed at 6 min. Zero NON-WORKER.
+
+Even with emu thread making ZERO Vulkan calls, crash persists. It's between GpuWorker and VulkanWorker — the pipeline parallelism itself.
+
+**Root cause:** GpuWorker calls `vkUpdateDescriptorSets` (on_dispatch) WHILE VulkanWorker executes `vkCmd*`. Both inside Mali driver simultaneously. In stable main, recording and execution are sequential (never concurrent inside Mali).
+
+**The ONLY remaining fix:** Move `vkUpdateDescriptorSets` to VulkanWorker via descriptor staging (SwapToStaging on GpuWorker, FlushStaging on VulkanWorker pre_execute). Previously tried (v6) but caused init crash from Fill sentencing underflow — that bug is now fixed. Retry descriptor staging.
