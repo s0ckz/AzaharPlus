@@ -34,8 +34,9 @@ std::size_t ResourcePool::CommitResource() {
     // Try to find a free resource from the hinted position to the end.
     auto found = search(hint_iterator, ticks.size());
     if (!found) {
-        // Refresh semaphore to query updated results
-        master_semaphore->Refresh();
+        // Use cached gpu_tick (refreshed by VulkanWorker's submit lambda).
+        // Calling Refresh() here would enter the Mali driver on the
+        // GpuWorker thread, risking concurrent access with VulkanWorker.
         gpu_tick = master_semaphore->KnownGpuTick();
         found = search(hint_iterator, ticks.size());
     }

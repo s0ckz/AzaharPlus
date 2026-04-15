@@ -91,6 +91,11 @@ public:
     void RegisterOnDispatch(std::function<void()>&& func) {
         on_dispatch = std::move(func);
     }
+    void RegisterPreExecute(std::function<void()>&& func) {
+        pre_execute = std::move(func);
+    }
+
+    bool HasWorkerThread() const { return use_worker_thread; }
 
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
@@ -216,6 +221,7 @@ private:
     StateFlags state{};
     std::function<void()> on_submit;
     std::function<void()> on_dispatch;
+    std::function<void()> pre_execute;
     std::mutex execution_mutex;
     std::mutex reserve_mutex;
     std::mutex queue_mutex;
