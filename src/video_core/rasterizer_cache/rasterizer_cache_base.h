@@ -125,6 +125,12 @@ public:
     /// Get a surface that matches a "texture copy" display transfer config
     SurfaceRect_Tuple GetTexCopySurface(const SurfaceParams& params);
 
+    /// Returns the id of the largest cached surface with a valid pixel format that
+    /// fully contains [addr, addr+size). Used by the deferred sw-TextureCopy path
+    /// (RasterizerVulkan::TryDeferredTextureCopy) to decide if an async readback
+    /// is possible for regions the geometric AccelerateTextureCopy check rejected.
+    SurfaceId FindContainingSurface(PAddr addr, u32 size);
+
     /// Write any cached resources overlapping the region back to memory (if dirty)
     void FlushRegion(PAddr addr, u32 size, SurfaceId flush_surface = {});
 

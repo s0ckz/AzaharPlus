@@ -66,6 +66,18 @@ public:
         return false;
     }
 
+    /// Attempt to issue a non-blocking / deferred CPU-visible texture copy. When the
+    /// source region lives on the GPU but the geometric constraints of
+    /// AccelerateTextureCopy reject it, the renderer may still be able to issue an
+    /// async readback and defer the CPU memcpy until its destination data is
+    /// actually needed, avoiding the mid-frame vkDeviceWaitIdle-equivalent that
+    /// the fallback `SwBlitter::TextureCopy` + `FlushRegion` path incurs (~15ms
+    /// stall on Mali G52 in MK7 gameplay). Default is to return false; only the
+    /// Vulkan rasterizer currently implements the deferred path.
+    virtual bool TryDeferredTextureCopy(const Pica::DisplayTransferConfig&) {
+        return false;
+    }
+
     /// Attempt to use a faster method to fill a region
     virtual bool AccelerateFill(const Pica::MemoryFillConfig&) {
         return false;

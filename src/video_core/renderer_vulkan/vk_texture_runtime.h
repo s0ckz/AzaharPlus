@@ -160,6 +160,12 @@ public:
     /// Returns true if the provided pixel format needs convertion
     bool NeedsConversion(VideoCore::PixelFormat format) const;
 
+    /// Marks `size` bytes of the internal download stream buffer as consumed.
+    /// Public surface over the private `download_buffer` so the deferred sw-tc
+    /// path in RasterizerVulkan can commit a staging slice it holds across the
+    /// boundary of a single Surface::DownloadAsync call.
+    void CommitDownload(u32 size);
+
 private:
     /// Clears a partial texture rect using a clear rectangle
     void ClearTextureWithRenderpass(Surface& surface, const VideoCore::TextureClear& clear);
@@ -253,6 +259,15 @@ public:
     /// Downloads pixel data to staging from a rectangle region of the surface texture
     void Download(const VideoCore::BufferTextureCopy& download,
                   const VideoCore::StagingData& staging);
+
+    /// Non-blocking variant of Download. Records the vkCmdCopyImageToBuffer into the
+    /// current scheduler chunk and submits it via scheduler.Flush() without waiting
+    /// for the fence. Returns the scheduler tick the caller must Wait on before
+    /// reading `staging.mapped`. Used by the deferred sw-TextureCopy path to avoid
+    /// a mid-frame pipeline stall. Does NOT call download_buffer.Commit — the caller
+    /// must do that after it's read the staging data.
+    u64 DownloadAsync(const VideoCore::BufferTextureCopy& download,
+                      const VideoCore::StagingData& staging);
 
     /// Scales up the surface to match the new resolution scale.
     void ScaleUp(u32 new_scale);

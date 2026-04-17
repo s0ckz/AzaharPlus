@@ -66,6 +66,27 @@ std::uint64_t g_drawopt_tex_full = 0;
 std::uint64_t g_drawopt_bind_skip = 0;
 std::uint64_t g_drawopt_bind_full = 0;
 
+// SwTexCopyProbe — split times for SwBlitter::TextureCopy fallback.
+std::uint64_t g_swtc_calls = 0;
+std::uint64_t g_swtc_flush_ns = 0;
+std::uint64_t g_swtc_memcpy_ns = 0;
+std::uint64_t g_swtc_invalidate_ns = 0;
+std::uint64_t g_swtc_total_bytes = 0;
+
+// TexCopyBailProbe — 1:1 with the `return false` sites in
+// RasterizerCache::AccelerateTextureCopy.
+std::uint64_t g_texcopy_accel = 0;
+std::uint64_t g_texcopy_bail_copy_size_zero = 0;
+std::uint64_t g_texcopy_bail_input_width_zero = 0;
+std::uint64_t g_texcopy_bail_copy_mod_input_width = 0;
+std::uint64_t g_texcopy_bail_output_width_zero = 0;
+std::uint64_t g_texcopy_bail_copy_mod_output_width = 0;
+std::uint64_t g_texcopy_bail_src_surface_miss = 0;
+std::uint64_t g_texcopy_bail_output_gap_mismatch = 0;
+std::uint64_t g_texcopy_bail_dst_surface_miss = 0;
+std::uint64_t g_texcopy_bail_dst_not_blittable = 0;
+std::uint64_t g_texcopy_bail_width_mismatch = 0;
+
 inline std::uint64_t NsSince(std::chrono::steady_clock::time_point t0) {
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -277,6 +298,64 @@ void IncDrawOptTexCacheSkip()  { ++g_drawopt_tex_skip; }
 void IncDrawOptTexCacheFull()  { ++g_drawopt_tex_full; }
 void IncDrawOptBindDescSkip()  { ++g_drawopt_bind_skip; }
 void IncDrawOptBindDescFull()  { ++g_drawopt_bind_full; }
+
+TexCopyBailCounters GetAndResetTexCopyProbe() {
+    TexCopyBailCounters out{g_texcopy_accel,
+                            g_texcopy_bail_copy_size_zero,
+                            g_texcopy_bail_input_width_zero,
+                            g_texcopy_bail_copy_mod_input_width,
+                            g_texcopy_bail_output_width_zero,
+                            g_texcopy_bail_copy_mod_output_width,
+                            g_texcopy_bail_src_surface_miss,
+                            g_texcopy_bail_output_gap_mismatch,
+                            g_texcopy_bail_dst_surface_miss,
+                            g_texcopy_bail_dst_not_blittable,
+                            g_texcopy_bail_width_mismatch};
+    g_texcopy_accel = 0;
+    g_texcopy_bail_copy_size_zero = 0;
+    g_texcopy_bail_input_width_zero = 0;
+    g_texcopy_bail_copy_mod_input_width = 0;
+    g_texcopy_bail_output_width_zero = 0;
+    g_texcopy_bail_copy_mod_output_width = 0;
+    g_texcopy_bail_src_surface_miss = 0;
+    g_texcopy_bail_output_gap_mismatch = 0;
+    g_texcopy_bail_dst_surface_miss = 0;
+    g_texcopy_bail_dst_not_blittable = 0;
+    g_texcopy_bail_width_mismatch = 0;
+    return out;
+}
+
+void IncTexCopyAccel()                   { ++g_texcopy_accel; }
+void IncTexCopyBailCopySizeZero()        { ++g_texcopy_bail_copy_size_zero; }
+void IncTexCopyBailInputWidthZero()      { ++g_texcopy_bail_input_width_zero; }
+void IncTexCopyBailCopyModInputWidth()   { ++g_texcopy_bail_copy_mod_input_width; }
+void IncTexCopyBailOutputWidthZero()     { ++g_texcopy_bail_output_width_zero; }
+void IncTexCopyBailCopyModOutputWidth()  { ++g_texcopy_bail_copy_mod_output_width; }
+void IncTexCopyBailSrcSurfaceMiss()      { ++g_texcopy_bail_src_surface_miss; }
+void IncTexCopyBailOutputGapMismatch()   { ++g_texcopy_bail_output_gap_mismatch; }
+void IncTexCopyBailDstSurfaceMiss()      { ++g_texcopy_bail_dst_surface_miss; }
+void IncTexCopyBailDstNotBlittable()     { ++g_texcopy_bail_dst_not_blittable; }
+void IncTexCopyBailWidthMismatch()       { ++g_texcopy_bail_width_mismatch; }
+
+SwTexCopyCounters GetAndResetSwTexCopyProbe() {
+    SwTexCopyCounters out{g_swtc_calls, g_swtc_flush_ns, g_swtc_memcpy_ns,
+                          g_swtc_invalidate_ns, g_swtc_total_bytes};
+    g_swtc_calls = 0;
+    g_swtc_flush_ns = 0;
+    g_swtc_memcpy_ns = 0;
+    g_swtc_invalidate_ns = 0;
+    g_swtc_total_bytes = 0;
+    return out;
+}
+
+void AddSwTexCopyCall(std::uint64_t flush_ns, std::uint64_t memcpy_ns,
+                      std::uint64_t invalidate_ns, std::uint64_t bytes) {
+    ++g_swtc_calls;
+    g_swtc_flush_ns += flush_ns;
+    g_swtc_memcpy_ns += memcpy_ns;
+    g_swtc_invalidate_ns += invalidate_ns;
+    g_swtc_total_bytes += bytes;
+}
 
 PicaCore::PicaCore(Memory::MemorySystem& memory_, std::shared_ptr<DebugContext> debug_context_)
     : memory{memory_}, debug_context{std::move(debug_context_)},

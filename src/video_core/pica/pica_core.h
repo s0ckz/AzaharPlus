@@ -383,4 +383,50 @@ void IncDrawOptTexCacheFull();
 void IncDrawOptBindDescSkip();
 void IncDrawOptBindDescFull();
 
+// TexCopyBailProbe — per-reason counters for why RasterizerCache::Accelerate
+// TextureCopy returned false and forced the SwBlitter fallback. On MK7 heavy
+// scene we see 32 sw-tc/s ≈ 14 ms/frame of GPU→CPU readback + memcpy. The
+// ten reasons align 1:1 with the `return false` sites in AccelerateTextureCopy
+// (rasterizer_cache/rasterizer_cache.h); `accel` is the success-path count so
+// (sum of bails)/(bails + accel) gives the fallback fraction.
+struct TexCopyBailCounters {
+    std::uint64_t accel = 0;
+    std::uint64_t copy_size_zero = 0;
+    std::uint64_t input_width_zero = 0;
+    std::uint64_t copy_mod_input_width = 0;
+    std::uint64_t output_width_zero = 0;
+    std::uint64_t copy_mod_output_width = 0;
+    std::uint64_t src_surface_miss = 0;
+    std::uint64_t output_gap_mismatch = 0;
+    std::uint64_t dst_surface_miss = 0;
+    std::uint64_t dst_not_blittable = 0;
+    std::uint64_t width_mismatch = 0;
+};
+TexCopyBailCounters GetAndResetTexCopyProbe();
+void IncTexCopyAccel();
+void IncTexCopyBailCopySizeZero();
+void IncTexCopyBailInputWidthZero();
+void IncTexCopyBailCopyModInputWidth();
+void IncTexCopyBailOutputWidthZero();
+void IncTexCopyBailCopyModOutputWidth();
+void IncTexCopyBailSrcSurfaceMiss();
+void IncTexCopyBailOutputGapMismatch();
+void IncTexCopyBailDstSurfaceMiss();
+void IncTexCopyBailDstNotBlittable();
+void IncTexCopyBailWidthMismatch();
+
+// SwTexCopyProbe — split the SwBlitter::TextureCopy fallback into its three
+// phases so we know which one actually costs. For MK7 we expect the Flush
+// (GPU->CPU readback of render-target bytes) to dominate the 16 ms/frame.
+struct SwTexCopyCounters {
+    std::uint64_t calls = 0;
+    std::uint64_t flush_ns = 0;
+    std::uint64_t memcpy_ns = 0;
+    std::uint64_t invalidate_ns = 0;
+    std::uint64_t total_bytes = 0;
+};
+SwTexCopyCounters GetAndResetSwTexCopyProbe();
+void AddSwTexCopyCall(std::uint64_t flush_ns, std::uint64_t memcpy_ns,
+                      std::uint64_t invalidate_ns, std::uint64_t bytes);
+
 } // namespace Pica

@@ -753,6 +753,10 @@ bool TextureRuntime::NeedsConversion(VideoCore::PixelFormat format) const {
            traits.aspect != (vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil);
 }
 
+void TextureRuntime::CommitDownload(u32 size) {
+    download_buffer.Commit(size);
+}
+
 Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceParams& params)
     : SurfaceBase{params}, runtime{runtime_}, instance{runtime_.GetInstance()},
       scheduler{runtime_.GetScheduler()}, traits{instance.GetTraits(pixel_format)},
@@ -1111,6 +1115,96 @@ void Surface::Download(const VideoCore::BufferTextureCopy& download,
                                    vk::DependencyFlagBits::eByRegion, memory_write_barrier, {},
                                    image_write_barrier);
         });
+}
+
+u64 Surface::DownloadAsync(const VideoCore::BufferTextureCopy& download,
+                           const VideoCore::StagingData& staging) {
+    // Async variant: records the same barriers + vkCmdCopyImageToBuffer as Download(),
+    // then submits via scheduler.Flush() (no fence wait). The returned tick is the
+    // one the caller must Wait on before reading `staging.mapped`. Unlike Download(),
+    // this does not call download_buffer.Commit — the caller owns the lifecycle of
+    // the staging slice until drain.
+
+    runtime.renderpass_cache.EndRendering();
+
+    if (pixel_format == PixelFormat::D24S8) {
+        runtime.blit_helper.DepthToBuffer(*this, runtime.download_buffer.Handle(), download);
+        scheduler.Flush();
+        return scheduler.CurrentTick();
+    }
+
+    if (res_scale != 1) {
+        const VideoCore::TextureBlit blit = {
+            .src_level = download.texture_level,
+            .dst_level = download.texture_level,
+            .src_rect = download.texture_rect * res_scale,
+            .dst_rect = download.texture_rect,
+        };
+        BlitScale(blit, false);
+    }
+
+    const RecordParams params = {
+        .aspect = Aspect(),
+        .pipeline_flags = PipelineStageFlags(),
+        .src_access = AccessFlags(),
+        .src_image = Image(Type::Base),
+    };
+
+    scheduler.Record(
+        [buffer = runtime.download_buffer.Handle(), params, download](vk::CommandBuffer cmdbuf) {
+            const auto rect = download.texture_rect;
+            const vk::BufferImageCopy buffer_image_copy = {
+                .bufferOffset = download.buffer_offset,
+                .bufferRowLength = rect.GetWidth(),
+                .bufferImageHeight = rect.GetHeight(),
+                .imageSubresource{
+                    .aspectMask = params.aspect,
+                    .mipLevel = download.texture_level,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+                .imageOffset = {static_cast<s32>(rect.left), static_cast<s32>(rect.bottom), 0},
+                .imageExtent = {rect.GetWidth(), rect.GetHeight(), 1},
+            };
+
+            const vk::ImageMemoryBarrier read_barrier = {
+                .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+                .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+                .oldLayout = vk::ImageLayout::eGeneral,
+                .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = params.src_image,
+                .subresourceRange = MakeSubresourceRange(params.aspect, download.texture_level),
+            };
+            const vk::ImageMemoryBarrier image_write_barrier = {
+                .srcAccessMask = vk::AccessFlagBits::eNone,
+                .dstAccessMask = vk::AccessFlagBits::eMemoryWrite,
+                .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = params.src_image,
+                .subresourceRange = MakeSubresourceRange(params.aspect, download.texture_level),
+            };
+            const vk::MemoryBarrier memory_write_barrier = {
+                .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+                .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+            };
+
+            cmdbuf.pipelineBarrier(params.pipeline_flags, vk::PipelineStageFlagBits::eTransfer,
+                                   vk::DependencyFlagBits::eByRegion, {}, {}, read_barrier);
+
+            cmdbuf.copyImageToBuffer(params.src_image, vk::ImageLayout::eTransferSrcOptimal, buffer,
+                                     buffer_image_copy);
+
+            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, params.pipeline_flags,
+                                   vk::DependencyFlagBits::eByRegion, memory_write_barrier, {},
+                                   image_write_barrier);
+        });
+
+    scheduler.Flush();
+    return scheduler.CurrentTick();
 }
 
 void Surface::ScaleUp(u32 new_scale) {
