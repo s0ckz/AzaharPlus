@@ -319,13 +319,24 @@ vk::UniqueInstance CreateInstance(const Common::DynamicLibrary& library,
         .apiVersion = TargetVulkanApiVersion,
     };
 
-    boost::container::static_vector<const char*, 2> layers;
+    boost::container::static_vector<const char*, 3> layers;
     if (enable_validation) {
         layers.push_back("VK_LAYER_KHRONOS_validation");
     }
     if (dump_command_buffers) {
         layers.push_back("VK_LAYER_LUNARG_api_dump");
     }
+#ifdef ANDROID
+    // Mali G52 r25p0 (Anbernic RG DS and other RK356x handhelds) has a
+    // thread-unsafe TOCTOU in its internal dispatch at libGLES_mali offsets
+    // 0x9e5014 and 0x9e6730: when the emu + GpuWorker + VulkanWorker threads
+    // all enter Vulkan concurrently, a field at ctx+0x20 transitions to NULL
+    // between a check and a use, producing "fault addr 0x60" / "fault 0x8"
+    // SIGSEGVs. Our bundled layer serialises every hot Mali entry with a
+    // global recursive mutex. The layer is a no-op (pass-through, zero cost)
+    // on any non-Mali-G52 device.
+    layers.push_back("VK_LAYER_AZAHAR_mali_serialize");
+#endif
 
     vk::InstanceCreateInfo instance_ci = {
         .flags = GetInstanceFlags(),
