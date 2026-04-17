@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <boost/container/small_vector.hpp>
 #include "common/alignment.h"
 #include "common/literals.h"
 #include "common/logging/log.h"
@@ -845,6 +846,236 @@ bool RasterizerVulkan::AccelerateTextureCopy(const Pica::DisplayTransferConfig& 
 }
 
 bool RasterizerVulkan::TryDeferredTextureCopy(const Pica::DisplayTransferConfig& config) {
+    // Two-stage path: try Fix A (GPU->GPU vkCmdCopyImage, no CPU round-trip at
+    // all, no fence Wait) first; fall back to Fix B (async readback + deferred
+    // memcpy) when Fix A's preconditions aren't met (non-tile-aligned, wrong
+    // surface type, etc.).
+    if (TryGpuToGpuShiftedCopy(config)) {
+        return true;
+    }
+    return TryAsyncMemcpyCopy(config);
+}
+
+bool RasterizerVulkan::TryGpuToGpuShiftedCopy(const Pica::DisplayTransferConfig& config) {
+    // Fix A: issue the 3DS "TextureCopy as raw byte memcpy" on the GPU side.
+    //
+    // Premise: the game is memcpy'ing a chunk of bytes from a tiled render
+    // target (source) to another address (destination). Both source and
+    // destination are to be interpreted under the same tile layout (same
+    // stride + same format). We copy pixel values from the source VkImage to
+    // a destination VkImage with matching tile layout, such that byte-for-byte
+    // semantics are preserved:
+    //
+    //   src byte src_offset+i  ==  dst byte i  (for i in [0, copy_size))
+    //
+    // Because same-layout tile bytes map 1:1 to pixels (8x8 tile at the same
+    // format), copying src pixels at tile-layout offset (src_offset + i) to
+    // dst pixels at tile-layout offset (i) preserves byte equality.
+    //
+    // The tricky part is that src_offset/tile_bytes (the "tile shift") may
+    // be non-zero, so a full source row of tiles maps to a dst row-wrap of
+    // tiles. We decompose each dst row into at most two rectangular pixel
+    // copies — "tiles_first_src from src row X" + "tile_shift from src row
+    // X+1" — and issue the whole batch as one vkCmdCopyImage with a regions
+    // array. No scheduler.Finish, so the emu thread never Waits on the GPU.
+    //
+    // Scope: contiguous (no strides), tile-aligned src/dst/size, source is a
+    // cached tiled non-Texture surface. Anything else → false (caller tries
+    // Fix B deferred-memcpy, then the blocking SwBlitter as final fallback).
+    const u32 copy_size = Common::AlignDown(config.texture_copy.size, 16);
+    if (copy_size == 0) {
+        return false;
+    }
+    const u32 input_gap = config.texture_copy.input_gap * 16;
+    const u32 output_gap = config.texture_copy.output_gap * 16;
+    if (input_gap != 0 || output_gap != 0) {
+        return false;
+    }
+
+    const PAddr src_addr = config.GetPhysicalInputAddress();
+    const PAddr dst_addr = config.GetPhysicalOutputAddress();
+
+    // Drain any deferred memcpys overlapping src or dst first — we're about
+    // to read src and overwrite dst on the GPU, so CPU-side shadow state
+    // needs to reflect that.
+    DrainDeferredSwTcOverlapping(src_addr, copy_size);
+    DrainDeferredSwTcOverlapping(dst_addr, copy_size);
+
+    const VideoCore::SurfaceId src_id = res_cache.FindContainingSurface(src_addr, copy_size);
+    if (!src_id) {
+        return false;
+    }
+    Surface& src_surface = res_cache.GetSurface(src_id);
+    if (!src_surface.is_tiled) {
+        return false;
+    }
+    if (src_surface.type == VideoCore::SurfaceType::Fill ||
+        src_surface.type == VideoCore::SurfaceType::Invalid ||
+        src_surface.type == VideoCore::SurfaceType::Texture ||
+        src_surface.pixel_format == VideoCore::PixelFormat::Invalid) {
+        return false;
+    }
+
+    // Tile-layout arithmetic.
+    const u32 bpp_bits = VideoCore::GetFormatBpp(src_surface.pixel_format);
+    if (bpp_bits == 0 || (bpp_bits & 0x7) != 0) {
+        return false;
+    }
+    const u32 tile_pixels = 64; // 8x8
+    const u32 tile_bytes = (tile_pixels * bpp_bits) / 8;
+    if (tile_bytes == 0) {
+        return false;
+    }
+    if (src_surface.stride == 0 || (src_surface.stride & 0x7) != 0) {
+        return false;
+    }
+    const u32 tiles_per_row = src_surface.stride / 8;
+    if (tiles_per_row == 0) {
+        return false;
+    }
+
+    // Tile alignment check on all three endpoints.
+    const u32 src_offset = src_addr - src_surface.addr;
+    if ((src_offset % tile_bytes) != 0) {
+        return false;
+    }
+    if ((copy_size % tile_bytes) != 0) {
+        return false;
+    }
+    // dst_addr doesn't need to be aligned to tile_bytes relative to its own
+    // surface (we create the destination surface starting exactly at
+    // dst_addr, so the dst tile-offset is zero by construction).
+
+    const u32 src_first_tile = src_offset / tile_bytes;
+    const u32 copy_tiles = copy_size / tile_bytes;
+    const u32 tile_shift = src_first_tile % tiles_per_row;
+    const u32 tiles_first_src = tiles_per_row - tile_shift;
+    const u32 src_first_row_of_tiles = src_first_tile / tiles_per_row;
+
+    // Destination surface — match src layout exactly (format, stride, tile),
+    // sized to cover copy_size bytes starting at dst_addr with dst tile-offset
+    // zero.
+    const u32 dst_rows_needed = (copy_tiles + tiles_per_row - 1) / tiles_per_row;
+    VideoCore::SurfaceParams dst_params{};
+    dst_params.addr = dst_addr;
+    dst_params.width = src_surface.stride;
+    dst_params.stride = src_surface.stride;
+    dst_params.height = dst_rows_needed * 8;
+    dst_params.levels = 1;
+    dst_params.is_tiled = true;
+    dst_params.pixel_format = src_surface.pixel_format;
+    dst_params.res_scale = src_surface.res_scale;
+    dst_params.UpdateParams();
+
+    // Refuse to copy into the source's own memory (in-place alias). GPU->GPU
+    // same-image copies have layout hazards we don't need to deal with here.
+    if (dst_params.end > src_surface.addr && dst_params.addr < src_surface.end) {
+        return false;
+    }
+
+    const VideoCore::SurfaceId dst_id = res_cache.GetSurface(
+        dst_params, VideoCore::ScaleMatch::Exact, /*load_if_create=*/false);
+    if (!dst_id) {
+        return false;
+    }
+    Surface& dst_surface = res_cache.GetSurface(dst_id);
+
+    // Decompose the byte range into (up to 2 * dst_rows_needed) TextureCopy
+    // entries. Each dst row Y is covered by:
+    //   Part A: tiles_first_src tiles from src_row=(src_first_row_of_tiles + Y),
+    //           starting at src tile-column = tile_shift, copied to dst
+    //           (row=Y, col=0).
+    //   Part B: tile_shift tiles from src_row=(src_first_row_of_tiles + Y + 1),
+    //           starting at src tile-column = 0, copied to dst
+    //           (row=Y, col=tiles_first_src).
+    // The last dst row may be partial (fewer than tiles_per_row tiles); the
+    // second part may be zero-length there.
+    boost::container::small_vector<VideoCore::TextureCopy, 64> copies;
+    u32 tiles_copied = 0;
+    for (u32 dst_row = 0; dst_row < dst_rows_needed; ++dst_row) {
+        const u32 tiles_in_this_dst_row =
+            std::min(tiles_per_row, copy_tiles - tiles_copied);
+
+        const u32 part_a_tiles = std::min(tiles_first_src, tiles_in_this_dst_row);
+        if (part_a_tiles > 0) {
+            copies.push_back(VideoCore::TextureCopy{
+                .src_level = 0,
+                .dst_level = 0,
+                .src_layer = 0,
+                .dst_layer = 0,
+                .src_offset = {tile_shift * 8, (src_first_row_of_tiles + dst_row) * 8},
+                .dst_offset = {0, dst_row * 8},
+                .extent = {part_a_tiles * 8, 8},
+            });
+            tiles_copied += part_a_tiles;
+        }
+
+        if (tiles_copied >= copy_tiles) {
+            break;
+        }
+
+        const u32 remaining_in_row = tiles_in_this_dst_row - part_a_tiles;
+        const u32 part_b_tiles = std::min(tile_shift, remaining_in_row);
+        if (part_b_tiles > 0) {
+            copies.push_back(VideoCore::TextureCopy{
+                .src_level = 0,
+                .dst_level = 0,
+                .src_layer = 0,
+                .dst_layer = 0,
+                .src_offset = {0, (src_first_row_of_tiles + dst_row + 1) * 8},
+                .dst_offset = {tiles_first_src * 8, dst_row * 8},
+                .extent = {part_b_tiles * 8, 8},
+            });
+            tiles_copied += part_b_tiles;
+        }
+    }
+
+    if (copies.empty() || tiles_copied != copy_tiles) {
+        return false;
+    }
+
+    // Bounds sanity: every rectangle must fit in both images.
+    for (const auto& c : copies) {
+        if (c.src_offset.x + c.extent.width > src_surface.width ||
+            c.src_offset.y + c.extent.height > src_surface.height) {
+            return false;
+        }
+        if (c.dst_offset.x + c.extent.width > dst_surface.width ||
+            c.dst_offset.y + c.extent.height > dst_surface.height) {
+            return false;
+        }
+    }
+
+    // Scale rectangles up if source is at a higher resolution (upscaling is
+    // transparent for both images since dst inherits src's res_scale).
+    if (src_surface.res_scale > 1) {
+        const u32 s = src_surface.res_scale;
+        for (auto& c : copies) {
+            c.src_offset.x *= s;
+            c.src_offset.y *= s;
+            c.dst_offset.x *= s;
+            c.dst_offset.y *= s;
+            c.extent.width *= s;
+            c.extent.height *= s;
+        }
+    }
+
+    if (!runtime.CopyTextures(src_surface, dst_surface, std::span<const VideoCore::TextureCopy>(
+                                                            copies.data(), copies.size()))) {
+        return false;
+    }
+
+    // The dst surface now owns valid GPU data for [dst_addr, dst_addr+copy_size).
+    // InvalidateRegion with region_owner=dst_id evicts any prior caches
+    // overlapping dst AND marks dst's valid-region bitmap so later reads see
+    // dst as authoritative — no CPU upload triggered when the texture is
+    // sampled.
+    res_cache.InvalidateRegion(dst_addr, copy_size, dst_id);
+
+    return true;
+}
+
+bool RasterizerVulkan::TryAsyncMemcpyCopy(const Pica::DisplayTransferConfig& config) {
     // Deferred sw-TextureCopy (Fix B). When the geometric AccelerateTextureCopy
     // has just rejected the copy (falling through to SwBlitter), we may still
     // be able to handle it without the ~15 ms CPU stall inside scheduler.Finish
