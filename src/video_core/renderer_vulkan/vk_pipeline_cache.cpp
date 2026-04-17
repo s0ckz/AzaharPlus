@@ -12,6 +12,7 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/loader/loader.h"
+#include "video_core/pica/pica_core.h"
 #include "video_core/pica/shader_setup.h"
 #include "video_core/renderer_vulkan/pica_to_vk.h"
 #include "video_core/renderer_vulkan/vk_descriptor_update_queue.h"
@@ -377,7 +378,22 @@ bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built) {
 
     const bool is_dirty = scheduler.IsStateDirty(StateFlags::Pipeline);
     const bool pipeline_dirty = (current_pipeline != pipeline) || is_dirty;
-    scheduler.Record([this, is_dirty, pipeline_dirty, pipeline,
+
+    // Optimization C: skip cmdbuf.bindDescriptorSets when the set handles and
+    // dynamic offsets match the previous draw and the scheduler hasn't marked
+    // the descriptor binding stale. With optimization B reusing texture sets
+    // across same-state draws, this kicks in frequently.
+    const bool desc_dirty = scheduler.IsStateDirty(StateFlags::DescriptorSets);
+    const bool bind_desc_needed = !last_bound_valid || desc_dirty ||
+                                   last_bound_descriptor_sets != bound_descriptor_sets ||
+                                   last_offsets != offsets;
+    if (bind_desc_needed) {
+        Pica::IncDrawOptBindDescFull();
+    } else {
+        Pica::IncDrawOptBindDescSkip();
+    }
+
+    scheduler.Record([this, is_dirty, pipeline_dirty, bind_desc_needed, pipeline,
                       current_dynamic = current_info.dynamic_info, dynamic = info.dynamic_info,
                       descriptor_sets = bound_descriptor_sets, offsets = offsets,
                       current_rasterization = current_info.state.rasterization,
@@ -485,12 +501,19 @@ bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built) {
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
         }
 
-        cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0,
-                                  descriptor_sets, offsets);
+        if (bind_desc_needed) {
+            cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0,
+                                      descriptor_sets, offsets);
+        }
     });
 
     current_info = info;
     current_pipeline = pipeline;
+    if (bind_desc_needed) {
+        last_bound_descriptor_sets = bound_descriptor_sets;
+        last_offsets = offsets;
+        last_bound_valid = true;
+    }
     scheduler.MarkStateNonDirty(StateFlags::Pipeline | StateFlags::DescriptorSets);
 
     return true;

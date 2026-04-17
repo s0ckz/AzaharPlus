@@ -523,6 +523,38 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
                      ? static_cast<double>(pica_writes.burst_items) /
                            static_cast<double>(pica_writes.burst_invocations)
                      : 0.0);
+        // DrawProbe: per-second draw-call attribution. `accel` = HW vertex
+        // shader path (rasterizer->AccelerateDrawBatch accepted). `cpu` =
+        // fallback — PICA vertex shader executed on the emu thread per
+        // vertex, then rasterizer->DrawTriangles(). `imm` = immediate-mode
+        // (rare). Sum(ms) is a lower bound on time spent in cmdlist's
+        // trigger_draw handler; subtract from GpuExecProbe cmdlist_ms to
+        // estimate reg-write vs draw-submit cost.
+        const auto draw = Pica::GetAndResetDrawProbe();
+        LOG_INFO(HW_GPU,
+                 "DrawProbe accel[n={} ms={:.2f} vtx={}] cpu[n={} ms={:.2f} vtx={}] "
+                 "imm[n={} ms={:.2f}]",
+                 draw.accel_n, draw.accel_ns / 1.0e6, draw.vertices_accel,
+                 draw.cpu_n, draw.cpu_ns / 1.0e6, draw.vertices_cpu,
+                 draw.imm_n, draw.imm_ns / 1.0e6);
+        // DrawOptProbe: per-second hit/miss counts for the three draw-path
+        // optimizations. `sync`=SyncDrawState gate (A), `tex`=SyncTextureUnits
+        // cache (B), `bind`=skip cmdbuf.bindDescriptorSets (C). Dividing
+        // skip/(skip+full) gives the hit rate — for 140 draws/frame, above 70%
+        // is the target since most consecutive SMB3DL draws share state.
+        const auto drawopt = Pica::GetAndResetDrawOptProbe();
+        const auto hit_rate = [](u64 s, u64 f) {
+            return (s + f) ? 100.0 * static_cast<double>(s) / static_cast<double>(s + f) : 0.0;
+        };
+        LOG_INFO(HW_GPU,
+                 "DrawOptProbe sync[skip={} full={} hit={:.1f}%] tex[skip={} full={} hit={:.1f}%] "
+                 "bind[skip={} full={} hit={:.1f}%]",
+                 drawopt.sync_state_skip, drawopt.sync_state_full,
+                 hit_rate(drawopt.sync_state_skip, drawopt.sync_state_full),
+                 drawopt.tex_cache_skip, drawopt.tex_cache_full,
+                 hit_rate(drawopt.tex_cache_skip, drawopt.tex_cache_full),
+                 drawopt.bind_desc_skip, drawopt.bind_desc_full,
+                 hit_rate(drawopt.bind_desc_skip, drawopt.bind_desc_full));
         LOG_INFO(HW_GPU,
                  "TexXferProbe tc[accel={} ({:.2f}ms) sw={} ({:.2f}ms)] "
                  "dt[accel={} ({:.2f}ms) sw={} ({:.2f}ms)] "

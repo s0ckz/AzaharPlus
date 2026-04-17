@@ -141,6 +141,20 @@ private:
     u32 uniform_size_aligned_vs;
     u32 uniform_size_aligned_fs;
     bool async_shaders{false};
+
+    // Draw-state dirty latch (optimization A). False until SyncDrawState has
+    // populated pipeline_info once; thereafter a clean rasterizer+framebuffer
+    // dirty_regs state lets us skip the rebuild.
+    bool draw_state_valid{false};
+
+    // Texture-unit cache (optimization B). Stores the (view, sampler) we wrote
+    // to the last Texture descriptor set, plus the scheduler tick when we did.
+    // On a cache hit within the same tick we reuse the previously-committed
+    // descriptor set (kept alive because its slot is still pinned to the
+    // current submission's tick by the resource pool).
+    std::array<vk::ImageView, 3> cached_tex_views{};
+    std::array<vk::Sampler, 3> cached_tex_samplers{};
+    u64 tex_cache_tick{0};
 };
 
 } // namespace Vulkan

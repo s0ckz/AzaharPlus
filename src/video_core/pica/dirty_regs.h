@@ -93,6 +93,17 @@ union DirtyRegs {
         return (framebuffer & ShadowMask1) || (tex_units & ShadowMask2);
     }
 
+    /**
+     * True if any reg that `RasterizerVulkan::SyncDrawState` reads into
+     * `pipeline_info.state` may have changed since the last reset. Conservative:
+     * any bit in the `rasterizer` or `framebuffer` qwords triggers a full sync.
+     * In practice SMB3DL has ~140 draws/frame where most consecutive draws
+     * share blend/depth/stencil/cull config, so the skip-fraction is high.
+     */
+    bool CheckDrawState() const {
+        return rasterizer != 0 || framebuffer != 0;
+    }
+
     struct {
         u64 misc;
         u64 rasterizer;

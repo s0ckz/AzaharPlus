@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <chrono>
 #include "common/arch.h"
 #include "common/archives.h"
 #include "common/microprofile.h"
@@ -46,6 +47,31 @@ std::uint64_t g_pica_writes_total = 0;
 std::uint64_t g_pica_burst_items = 0;
 std::uint64_t g_pica_burst_invocations = 0;
 std::uint64_t g_pica_fast_single = 0;
+
+// DrawProbe counters. Same thread affinity as the write counters above.
+std::uint64_t g_draw_accel_n = 0;
+std::uint64_t g_draw_accel_ns = 0;
+std::uint64_t g_draw_cpu_n = 0;
+std::uint64_t g_draw_cpu_ns = 0;
+std::uint64_t g_draw_imm_n = 0;
+std::uint64_t g_draw_imm_ns = 0;
+std::uint64_t g_draw_vertices_accel = 0;
+std::uint64_t g_draw_vertices_cpu = 0;
+
+// DrawOptProbe counters (Vulkan rasterizer shortcuts).
+std::uint64_t g_drawopt_sync_skip = 0;
+std::uint64_t g_drawopt_sync_full = 0;
+std::uint64_t g_drawopt_tex_skip = 0;
+std::uint64_t g_drawopt_tex_full = 0;
+std::uint64_t g_drawopt_bind_skip = 0;
+std::uint64_t g_drawopt_bind_full = 0;
+
+inline std::uint64_t NsSince(std::chrono::steady_clock::time_point t0) {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count());
+}
 
 // Compile-time bitmap of PICA register IDs that have a real (non-default) case
 // in PicaCore::WriteInternalReg's switch. The complement — everything NOT in
@@ -217,6 +243,40 @@ PicaWriteProbeCounters GetAndResetPicaWriteProbe() {
     g_pica_fast_single = 0;
     return out;
 }
+
+DrawProbeCounters GetAndResetDrawProbe() {
+    DrawProbeCounters out{g_draw_accel_n,        g_draw_accel_ns, g_draw_cpu_n,
+                          g_draw_cpu_ns,         g_draw_imm_n,    g_draw_imm_ns,
+                          g_draw_vertices_accel, g_draw_vertices_cpu};
+    g_draw_accel_n = 0;
+    g_draw_accel_ns = 0;
+    g_draw_cpu_n = 0;
+    g_draw_cpu_ns = 0;
+    g_draw_imm_n = 0;
+    g_draw_imm_ns = 0;
+    g_draw_vertices_accel = 0;
+    g_draw_vertices_cpu = 0;
+    return out;
+}
+
+DrawOptProbeCounters GetAndResetDrawOptProbe() {
+    DrawOptProbeCounters out{g_drawopt_sync_skip, g_drawopt_sync_full, g_drawopt_tex_skip,
+                             g_drawopt_tex_full,  g_drawopt_bind_skip, g_drawopt_bind_full};
+    g_drawopt_sync_skip = 0;
+    g_drawopt_sync_full = 0;
+    g_drawopt_tex_skip = 0;
+    g_drawopt_tex_full = 0;
+    g_drawopt_bind_skip = 0;
+    g_drawopt_bind_full = 0;
+    return out;
+}
+
+void IncDrawOptSyncStateSkip() { ++g_drawopt_sync_skip; }
+void IncDrawOptSyncStateFull() { ++g_drawopt_sync_full; }
+void IncDrawOptTexCacheSkip()  { ++g_drawopt_tex_skip; }
+void IncDrawOptTexCacheFull()  { ++g_drawopt_tex_full; }
+void IncDrawOptBindDescSkip()  { ++g_drawopt_bind_skip; }
+void IncDrawOptBindDescFull()  { ++g_drawopt_bind_full; }
 
 PicaCore::PicaCore(Memory::MemorySystem& memory_, std::shared_ptr<DebugContext> debug_context_)
     : memory{memory_}, debug_context{std::move(debug_context_)},
@@ -989,6 +1049,8 @@ void PicaCore::SubmitImmediate(u32 value) {
 }
 
 void PicaCore::DrawImmediate() {
+    const auto imm_t0 = std::chrono::steady_clock::now();
+
     // Compile the vertex shader.
     shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
 
@@ -1024,10 +1086,18 @@ void PicaCore::DrawImmediate() {
     if (debug_context) {
         debug_context->OnEvent(DebugContext::Event::FinishedPrimitiveBatch, nullptr);
     }
+
+    ++g_draw_imm_n;
+    g_draw_imm_ns += NsSince(imm_t0);
 }
 
 void PicaCore::DrawArrays(bool is_indexed) {
     MICROPROFILE_SCOPE(GPU_Drawing);
+
+    // DrawProbe: time each draw so we can attribute the GpuExecProbe cmdlist
+    // bucket to reg-writes vs actual draw submission.
+    const auto draw_t0 = std::chrono::steady_clock::now();
+    const u32 vertex_count = regs.internal.pipeline.num_vertices;
 
     // Track vertex in the debug recorder.
     if (debug_context) {
@@ -1058,6 +1128,9 @@ void PicaCore::DrawArrays(bool is_indexed) {
 
     // Attempt to use hardware vertex shaders if possible.
     if (accelerate_draw && rasterizer->AccelerateDrawBatch(is_indexed)) {
+        ++g_draw_accel_n;
+        g_draw_accel_ns += NsSince(draw_t0);
+        g_draw_vertices_accel += vertex_count;
         return;
     }
 
@@ -1070,6 +1143,10 @@ void PicaCore::DrawArrays(bool is_indexed) {
     if (debug_context) {
         debug_context->OnEvent(DebugContext::Event::FinishedPrimitiveBatch, nullptr);
     }
+
+    ++g_draw_cpu_n;
+    g_draw_cpu_ns += NsSince(draw_t0);
+    g_draw_vertices_cpu += vertex_count;
 }
 
 void PicaCore::LoadVertices(bool is_indexed) {

@@ -343,4 +343,44 @@ struct PicaWriteProbeCounters {
 };
 PicaWriteProbeCounters GetAndResetPicaWriteProbe();
 
+// Attribution of time spent inside PicaCore::DrawArrays / DrawImmediate.
+// `accel_*` = AccelerateDrawBatch accepted the draw (hw-shader path).
+// `cpu_*`   = fallback via LoadVertices (CPU runs the PICA vertex shader per
+//             vertex, then rasterizer->DrawTriangles() submits triangles).
+// `imm_*`   = immediate-mode draws (DrawImmediate). Typically rare; 3DS
+//             games mostly use indexed/array draws.
+// `vertices_accel` / `vertices_cpu` = pipeline.num_vertices summed per path
+// so we can see if CPU-fallback draws are also vertex-heavy.
+struct DrawProbeCounters {
+    std::uint64_t accel_n = 0;
+    std::uint64_t accel_ns = 0;
+    std::uint64_t cpu_n = 0;
+    std::uint64_t cpu_ns = 0;
+    std::uint64_t imm_n = 0;
+    std::uint64_t imm_ns = 0;
+    std::uint64_t vertices_accel = 0;
+    std::uint64_t vertices_cpu = 0;
+};
+DrawProbeCounters GetAndResetDrawProbe();
+
+// Draw-call optimization counters (Vulkan renderer). Each `_skip` counter
+// increments when the corresponding shortcut fired; each `_full` counter
+// tracks cache misses / first-use paths. Written from vk_rasterizer.cpp on
+// the emu thread; read+reset from VBlankCallback on the same thread.
+struct DrawOptProbeCounters {
+    std::uint64_t sync_state_skip = 0;    // SyncDrawState skipped (dirty-regs clean)
+    std::uint64_t sync_state_full = 0;    // SyncDrawState rebuilt pipeline_info
+    std::uint64_t tex_cache_skip = 0;     // SyncTextureUnits reused descriptor set
+    std::uint64_t tex_cache_full = 0;     // SyncTextureUnits acquired new set
+    std::uint64_t bind_desc_skip = 0;     // BindPipeline skipped bindDescriptorSets
+    std::uint64_t bind_desc_full = 0;     // BindPipeline issued bindDescriptorSets
+};
+DrawOptProbeCounters GetAndResetDrawOptProbe();
+void IncDrawOptSyncStateSkip();
+void IncDrawOptSyncStateFull();
+void IncDrawOptTexCacheSkip();
+void IncDrawOptTexCacheFull();
+void IncDrawOptBindDescSkip();
+void IncDrawOptBindDescFull();
+
 } // namespace Pica
