@@ -45,6 +45,80 @@ constexpr std::array<u32, 16> ExpandBitsToBytes = {
 std::uint64_t g_pica_writes_total = 0;
 std::uint64_t g_pica_burst_items = 0;
 std::uint64_t g_pica_burst_invocations = 0;
+std::uint64_t g_pica_fast_single = 0;
+
+// Compile-time bitmap of PICA register IDs that have a real (non-default) case
+// in PicaCore::WriteInternalReg's switch. The complement — everything NOT in
+// this set — falls into the default branch whose full effect is "merge value
+// into reg_array[id] + dirty_regs.Set(id)". For those, ProcessCmdList can
+// store-and-dirty inline without paying WriteInternalReg's 4-arg prologue,
+// the switch jump-table dispatch, or the pica-trace / debug-context checks.
+//
+// Trade-off: the inline fast path does NOT call OnPicaRegWrite (skips pica
+// tracing of default-case writes) and does NOT emit the
+// PicaCommandLoaded/Processed debug events. Both are debug-only features
+// that are off in gameplay; losing them on the hot default-case register
+// stream is the deliberate "dirty code for performance" trade we're making.
+//
+// The bitmap must stay in lockstep with the switch in WriteInternalReg —
+// drift means a real handler never runs (correctness bug). Keep the two
+// lists side-by-side visually when editing either.
+struct PicaHandlerBitmap {
+    std::array<std::uint64_t, (RegsInternal::NUM_REGS + 63) / 64> bits{};
+
+    constexpr void Mark(std::uint32_t id) {
+        bits[id / 64] |= (std::uint64_t{1} << (id % 64));
+    }
+    constexpr bool Contains(std::uint32_t id) const {
+        return (bits[id / 64] >> (id % 64)) & std::uint64_t{1};
+    }
+};
+
+constexpr PicaHandlerBitmap MakePicaHandlerBitmap() {
+    PicaHandlerBitmap b{};
+    b.Mark(PICA_REG_INDEX(irq_request));
+    b.Mark(PICA_REG_INDEX(pipeline.triangle_topology));
+    b.Mark(PICA_REG_INDEX(pipeline.restart_primitive));
+    b.Mark(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.index));
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        b.Mark(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[0]) + i);
+    }
+    b.Mark(PICA_REG_INDEX(pipeline.gpu_mode));
+    for (std::uint32_t i = 0; i < 2; ++i) {
+        b.Mark(PICA_REG_INDEX(pipeline.command_buffer.trigger[0]) + i);
+    }
+    b.Mark(PICA_REG_INDEX(pipeline.trigger_draw));
+    b.Mark(PICA_REG_INDEX(pipeline.trigger_draw_indexed));
+    b.Mark(PICA_REG_INDEX(gs.bool_uniforms));
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        b.Mark(PICA_REG_INDEX(gs.int_uniforms[0]) + i);
+    }
+    for (std::uint32_t i = 0; i < 8; ++i) {
+        b.Mark(PICA_REG_INDEX(gs.uniform_setup.set_value[0]) + i);
+        b.Mark(PICA_REG_INDEX(gs.program.set_word[0]) + i);
+        b.Mark(PICA_REG_INDEX(gs.swizzle_patterns.set_word[0]) + i);
+    }
+    b.Mark(PICA_REG_INDEX(vs.output_mask));
+    b.Mark(PICA_REG_INDEX(vs.bool_uniforms));
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        b.Mark(PICA_REG_INDEX(vs.int_uniforms[0]) + i);
+    }
+    for (std::uint32_t i = 0; i < 8; ++i) {
+        b.Mark(PICA_REG_INDEX(vs.uniform_setup.set_value[0]) + i);
+        b.Mark(PICA_REG_INDEX(vs.program.set_word[0]) + i);
+        b.Mark(PICA_REG_INDEX(vs.swizzle_patterns.set_word[0]) + i);
+        b.Mark(PICA_REG_INDEX(lighting.lut_data[0]) + i);
+        b.Mark(PICA_REG_INDEX(texturing.fog_lut_data[0]) + i);
+        b.Mark(PICA_REG_INDEX(texturing.proctex_lut_data[0]) + i);
+    }
+    return b;
+}
+
+constexpr PicaHandlerBitmap g_pica_handler_bitmap = MakePicaHandlerBitmap();
+
+inline bool PicaRegHasHandler(std::uint32_t id) {
+    return g_pica_handler_bitmap.Contains(id);
+}
 
 // True if `id` names a "pure-data" register whose WriteInternalReg handler only
 // stores a value into a side table and bumps an internal offset. For these, a
@@ -136,10 +210,11 @@ inline bool IsPureDataBurstReg(u32 id) {
 
 PicaWriteProbeCounters GetAndResetPicaWriteProbe() {
     PicaWriteProbeCounters out{g_pica_writes_total, g_pica_burst_items,
-                               g_pica_burst_invocations};
+                               g_pica_burst_invocations, g_pica_fast_single};
     g_pica_writes_total = 0;
     g_pica_burst_items = 0;
     g_pica_burst_invocations = 0;
+    g_pica_fast_single = 0;
     return out;
 }
 
@@ -232,11 +307,22 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) {
         const u32 value = cmd_list.head[cmd_list.current_index++];
         const CommandHeader header{cmd_list.head[cmd_list.current_index++]};
 
-        // Write the leading value through the normal path — it sees the full
-        // switch, so any cmd_id (including non-burst registers like
-        // trigger_draw, irq_request, …) is dispatched correctly.
-        WriteInternalReg(header.cmd_id, value, header.parameter_mask, stop_requested);
-        ++g_pica_writes_total;
+        // Leading write. Fast path: if cmd_id has no real handler in
+        // WriteInternalReg's switch, inline "merge + store + dirty". Saves the
+        // function-call prologue, the switch dispatch, and the debug hooks.
+        // Intentionally duplicated at the extras site below — the hot path
+        // stays a flat straight line with no indirection.
+        if (header.cmd_id < RegsInternal::NUM_REGS &&
+            !PicaRegHasHandler(header.cmd_id)) [[likely]] {
+            const u32 write_mask = ExpandBitsToBytes[header.parameter_mask];
+            u32& slot = regs.internal.reg_array[header.cmd_id];
+            slot = (slot & ~write_mask) | (value & write_mask);
+            dirty_regs.Set(header.cmd_id);
+            ++g_pica_fast_single;
+        } else {
+            WriteInternalReg(header.cmd_id, value, header.parameter_mask, stop_requested);
+            ++g_pica_writes_total;
+        }
 
         const u32 extra = header.extra_data_length;
         if (extra == 0) {
@@ -259,15 +345,47 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) {
             continue;
         }
 
-        // Generic path (group_commands, or a non-burst-safe target).
+        // Secondary burst case: a same-target burst (!group_commands) to a
+        // register that isn't in the pure-data allowlist. These still pay the
+        // real-handler cost per item, but they all have the same (no-op) mask
+        // expansion and bounds classification. If the target has no handler,
+        // we can service the whole run inline right here — saves one
+        // HasHandler lookup + one WriteInternalReg call per item in a tight
+        // loop. For "dirty code" speedup, fine — `cmd` is constant for the run.
+        if (!header.group_commands.Value() && !stop_requested &&
+            header.cmd_id < RegsInternal::NUM_REGS &&
+            !PicaRegHasHandler(header.cmd_id)) {
+            const u32 write_mask = ExpandBitsToBytes[header.parameter_mask];
+            u32& slot = regs.internal.reg_array[header.cmd_id];
+            for (u32 i = 0; i < extra; ++i) {
+                const u32 v = cmd_list.head[cmd_list.current_index++];
+                slot = (slot & ~write_mask) | (v & write_mask);
+            }
+            dirty_regs.Set(header.cmd_id);
+            g_pica_fast_single += extra;
+            continue;
+        }
+
+        // Generic path (group_commands, or a same-target handler register
+        // that's neither pure-data nor a no-op default-case).
         for (u32 i = 0; i < extra; ++i) {
             if (stop_requested) [[unlikely]] {
                 break;
             }
             const u32 cmd = header.cmd_id + (header.group_commands ? i + 1 : 0);
             const u32 extra_value = cmd_list.head[cmd_list.current_index++];
-            WriteInternalReg(cmd, extra_value, header.parameter_mask, stop_requested);
-            ++g_pica_writes_total;
+            // Per-item fast path — same logic as the leading write above,
+            // duplicated for zero-indirection hot loop.
+            if (cmd < RegsInternal::NUM_REGS && !PicaRegHasHandler(cmd)) [[likely]] {
+                const u32 write_mask = ExpandBitsToBytes[header.parameter_mask];
+                u32& slot = regs.internal.reg_array[cmd];
+                slot = (slot & ~write_mask) | (extra_value & write_mask);
+                dirty_regs.Set(cmd);
+                ++g_pica_fast_single;
+            } else {
+                WriteInternalReg(cmd, extra_value, header.parameter_mask, stop_requested);
+                ++g_pica_writes_total;
+            }
         }
     }
 }

@@ -515,10 +515,10 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
         // spread across `burst_invocations` runs (≈ items/invocation per run).
         const auto pica_writes = Pica::GetAndResetPicaWriteProbe();
         LOG_INFO(HW_GPU,
-                 "PicaWriteProbe writes={} burst_items={} burst_invocations={} "
-                 "avg_burst_len={:.1f}",
-                 pica_writes.writes_total, pica_writes.burst_items,
-                 pica_writes.burst_invocations,
+                 "PicaWriteProbe slow={} fast_single={} burst_items={} "
+                 "burst_invocations={} avg_burst_len={:.1f}",
+                 pica_writes.writes_total, pica_writes.fast_single,
+                 pica_writes.burst_items, pica_writes.burst_invocations,
                  pica_writes.burst_invocations
                      ? static_cast<double>(pica_writes.burst_items) /
                            static_cast<double>(pica_writes.burst_invocations)

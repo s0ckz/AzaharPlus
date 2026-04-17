@@ -338,6 +338,8 @@ struct PicaWriteProbeCounters {
     std::uint64_t writes_total = 0;      // individual WriteInternalReg invocations
     std::uint64_t burst_items = 0;       // items handled by WriteBurstSameReg fast path
     std::uint64_t burst_invocations = 0; // times the burst fast path was entered
+    std::uint64_t fast_single = 0;       // single writes short-circuited in-line
+                                         // (default-case regs: merge + dirty, no switch)
 };
 PicaWriteProbeCounters GetAndResetPicaWriteProbe();
 
