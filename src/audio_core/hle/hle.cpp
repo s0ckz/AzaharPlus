@@ -27,6 +27,7 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/perf_stats.h"
 
 using InterruptType = Service::DSP::InterruptType;
 
@@ -459,16 +460,27 @@ bool DspHle::Impl::Tick() {
 }
 
 void DspHle::Impl::AudioTickCallback(s64 cycles_late) {
+    // Bill DSP HLE tick wall time so PerfProbe can split it out of the 'rest' bucket.
+    // Runs on the emu thread via core_timing, nested inside Timer::Advance.
+    auto& system = Core::System::GetInstance();
+    if (system.perf_stats) {
+        system.perf_stats->BeginDSPProcessing();
+    }
+
     if (Tick()) {
         // TODO(merry): Signal all the other interrupts as appropriate.
         interrupt_handler(InterruptType::Pipe, DspPipe::Audio);
+    }
+
+    if (system.perf_stats) {
+        system.perf_stats->EndDSPProcessing();
     }
 
     // Reschedule recurrent event
     const double time_scale =
         Settings::values.enable_realtime_audio
             ? std::max(0.01, // Arbitrary small value to prevent time_scale from approaching zero
-                       Core::System::GetInstance().GetStableFrameTimeScale())
+                       system.GetStableFrameTimeScale())
             : 1.0;
     s64 adjusted_ticks = static_cast<s64>(audio_frame_ticks / time_scale - cycles_late);
     core_timing.ScheduleEvent(adjusted_ticks, tick_event);

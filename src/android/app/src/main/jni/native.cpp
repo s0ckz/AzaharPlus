@@ -5,6 +5,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <chrono>
 #include <codecvt>
 #include <thread>
 #include <dlfcn.h>
@@ -954,6 +955,27 @@ jdoubleArray Java_org_citra_citra_1emu_NativeLibrary_getPerfStats(JNIEnv* env,
                            results.time_remaining};
 
         env->SetDoubleArrayRegion(j_stats, 0, 9, stats);
+
+        // PerfProbe: 1 Hz logcat dump of the emu-thread budget split. Each bucket is
+        // walltime *per emulated vblank interval* in ms; comparing to 16.67 ms (60 Hz)
+        // shows which category blew the budget. 'rest' is dynarec JIT + uninstrumented
+        // work; 'tmr' is core_timing event dispatch (exclusive of 'dsp'); 'dsp' is the
+        // DSP HLE audio tick. Filter with: adb logcat | grep PerfProbe
+        static auto last_log = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log).count() >= 1000) {
+            last_log = now;
+            const double frame_ms = results.time_vblank_interval * 1000.0;
+            LOG_INFO(Frontend,
+                     "PerfProbe speed={:.1f}% sysFPS={:.1f} gameFPS={:.1f} frame={:.2f}ms "
+                     "[svc={:.2f} ipc={:.2f} gpu={:.2f} swap={:.2f} tmr={:.2f} dsp={:.2f} "
+                     "rest={:.2f}]",
+                     results.emulation_speed * 100.0, results.system_fps, results.game_fps,
+                     frame_ms, results.time_hle_svc * 1000.0, results.time_hle_ipc * 1000.0,
+                     results.time_gpu * 1000.0, results.time_swap * 1000.0,
+                     results.time_core_timing * 1000.0, results.time_dsp_hle * 1000.0,
+                     results.time_remaining * 1000.0);
+        }
     }
 
     return j_stats;

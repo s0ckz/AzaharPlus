@@ -8,7 +8,9 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/settings.h"
+#include "core/core.h"
 #include "core/core_timing.h"
+#include "core/perf_stats.h"
 
 namespace Core {
 
@@ -209,6 +211,16 @@ s64 Timing::Timer::GetMaxSliceLength() const {
 }
 
 void Timing::Timer::Advance() {
+    // Bill the whole Advance() wall time (MoveEvents + event dispatch) to perf_stats so
+    // PerfProbe can decompose the 'rest' bucket into pure-JIT time vs core-timing overhead.
+    // The DSP HLE tick runs from inside this loop and has its own Begin/EndDSPProcessing
+    // bracket — perf_stats.cpp reports core_timing exclusive of dsp_hle so they don't
+    // double-count.
+    auto& system = Core::System::GetInstance();
+    if (system.perf_stats) {
+        system.perf_stats->BeginCoreTimingProcessing();
+    }
+
     MoveEvents();
 
     s64 cycles_executed = slice_length - downcount;
@@ -231,6 +243,10 @@ void Timing::Timer::Advance() {
     }
 
     is_timer_sane = false;
+
+    if (system.perf_stats) {
+        system.perf_stats->EndCoreTimingProcessing();
+    }
 }
 
 void Timing::Timer::SetNextSlice(s64 max_slice_length) {

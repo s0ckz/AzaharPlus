@@ -2,8 +2,10 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <chrono>
 #include "common/archives.h"
 #include "common/hacks/hack_manager.h"
+#include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -28,6 +30,42 @@ constexpr VAddr VADDR_GPU = 0x1EF00000;
 
 MICROPROFILE_DEFINE(GPU_DisplayTransfer, "GPU", "DisplayTransfer", MP_RGB(100, 100, 255));
 MICROPROFILE_DEFINE(GPU_CmdlistProcessing, "GPU", "Cmdlist Processing", MP_RGB(100, 255, 100));
+
+namespace {
+// Accelerated-vs-software counters for the three memory-xfer paths. Software fallback
+// is catastrophically more expensive (forces GPU->CPU readback + memcpy + cache invalidate)
+// so knowing the ratio is the first thing to check when the PerfProbe 'gpu' bucket is
+// large. Updated on the emu thread inside GPU::Execute; reset under the same thread from
+// VBlankCallback — no locking needed.
+struct TexXferCounters {
+    std::uint64_t accel_tc = 0, accel_tc_ns = 0;
+    std::uint64_t accel_dt = 0, accel_dt_ns = 0;
+    std::uint64_t accel_mf = 0, accel_mf_ns = 0;
+    std::uint64_t sw_tc = 0, sw_tc_ns = 0;
+    std::uint64_t sw_dt = 0, sw_dt_ns = 0;
+    std::uint64_t sw_mf = 0, sw_mf_ns = 0;
+};
+TexXferCounters g_tex_xfer;
+
+// Sub-attribution of GPU::Execute wall time across cmdlist/dma/other. Sum of the ms
+// columns times vblanks-per-second should roughly match PerfProbe 'gpu' × sysFPS.
+struct GpuExecCounters {
+    std::uint64_t cmdlist_n = 0, cmdlist_ns = 0;
+    std::uint64_t dma_n = 0, dma_ns = 0;
+    std::uint64_t other_n = 0, other_ns = 0;
+};
+GpuExecCounters g_gpu_exec;
+
+inline std::uint64_t NsSince(std::chrono::steady_clock::time_point t0) {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count());
+}
+
+// 1 Hz rate limiter shared by the probes below so logcat isn't spammed.
+std::int64_t g_probe_last_ms = 0;
+} // namespace
 
 GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
          Frontend::EmuWindow* secondary_window)
@@ -89,6 +127,10 @@ void GPU::Execute(const Service::GSP::Command& command) {
     using Service::GSP::CommandId;
     auto& regs = impl->pica.regs;
 
+    // GpuExecProbe: bill wall time of each switch branch so the PerfProbe 'gpu' bucket
+    // can be split into cmdlist / dma / other.
+    const auto t0 = std::chrono::steady_clock::now();
+
     switch (command.id) {
     case CommandId::RequestDma: {
         impl->system.Memory().RasterizerFlushVirtualRegion(
@@ -103,6 +145,8 @@ void GPU::Execute(const Service::GSP::Command& command) {
         impl->memory.CopyBlock(*process, command.dma_request.dest_address,
                                command.dma_request.source_address, command.dma_request.size);
         impl->signal_interrupt(Service::GSP::InterruptId::DMA);
+        ++g_gpu_exec.dma_n;
+        g_gpu_exec.dma_ns += NsSince(t0);
         break;
     }
     case CommandId::SubmitCmdList: {
@@ -116,6 +160,8 @@ void GPU::Execute(const Service::GSP::Command& command) {
 
         // Trigger processing of the command list
         SubmitCmdList(0);
+        ++g_gpu_exec.cmdlist_n;
+        g_gpu_exec.cmdlist_ns += NsSince(t0);
         break;
     }
     case CommandId::MemoryFill: {
@@ -181,6 +227,20 @@ void GPU::Execute(const Service::GSP::Command& command) {
     }
     default:
         LOG_ERROR(HW_GPU, "Unknown command {:#08X}", command.id.Value());
+    }
+
+    // Everything not already tallied (fill / transfer / cache-flush / unknown) lands
+    // in 'other'. The inner fill/transfer timers in g_tex_xfer are a finer breakdown
+    // of this same work — presented side-by-side in the VBlank log so the per-frame
+    // attribution stays legible.
+    switch (command.id) {
+    case CommandId::RequestDma:
+    case CommandId::SubmitCmdList:
+        break;
+    default:
+        ++g_gpu_exec.other_n;
+        g_gpu_exec.other_ns += NsSince(t0);
+        break;
     }
 
     // Notify debugger that a GSP command was processed.
@@ -357,8 +417,14 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
     }
 
     // Perform memory fill.
-    if (!impl->rasterizer->AccelerateFill(config)) {
+    const auto mf_t0 = std::chrono::steady_clock::now();
+    if (impl->rasterizer->AccelerateFill(config)) {
+        ++g_tex_xfer.accel_mf;
+        g_tex_xfer.accel_mf_ns += NsSince(mf_t0);
+    } else {
         impl->sw_blitter->MemoryFill(config);
+        ++g_tex_xfer.sw_mf;
+        g_tex_xfer.sw_mf_ns += NsSince(mf_t0);
     }
 
     // It seems that it won't signal interrupt if "address_start" is zero.
@@ -393,14 +459,26 @@ void GPU::MemoryTransfer() {
 
     // Perform memory transfer
     if (config.is_texture_copy) {
-        if (!impl->rasterizer->AccelerateTextureCopy(config)) {
+        const auto tc_t0 = std::chrono::steady_clock::now();
+        if (impl->rasterizer->AccelerateTextureCopy(config)) {
+            ++g_tex_xfer.accel_tc;
+            g_tex_xfer.accel_tc_ns += NsSince(tc_t0);
+        } else {
             impl->sw_blitter->TextureCopy(config);
+            ++g_tex_xfer.sw_tc;
+            g_tex_xfer.sw_tc_ns += NsSince(tc_t0);
         }
     } else {
         if (right_eye_disabler->ShouldAllowDisplayTransfer(config.GetPhysicalInputAddress(),
                                                            config.input_height)) {
-            if (!impl->rasterizer->AccelerateDisplayTransfer(config)) {
+            const auto dt_t0 = std::chrono::steady_clock::now();
+            if (impl->rasterizer->AccelerateDisplayTransfer(config)) {
+                ++g_tex_xfer.accel_dt;
+                g_tex_xfer.accel_dt_ns += NsSince(dt_t0);
+            } else {
                 impl->sw_blitter->DisplayTransfer(config);
+                ++g_tex_xfer.sw_dt;
+                g_tex_xfer.sw_dt_ns += NsSince(dt_t0);
             }
         }
     }
@@ -417,6 +495,47 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     // Signal to GSP that GPU interrupt has occurred
     impl->signal_interrupt(Service::GSP::InterruptId::PDC0);
     impl->signal_interrupt(Service::GSP::InterruptId::PDC1);
+
+    // 1 Hz dump of the GPU sub-probes. Both counters are mutated on the emu thread
+    // inside GPU::Execute and reset here on the same thread, so no locking is needed.
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    if (now_ms - g_probe_last_ms >= 1000) {
+        g_probe_last_ms = now_ms;
+        LOG_INFO(HW_GPU,
+                 "GpuExecProbe cmdlist[n={} ms={:.2f}] dma[n={} ms={:.2f}] "
+                 "other[n={} ms={:.2f}]",
+                 g_gpu_exec.cmdlist_n, g_gpu_exec.cmdlist_ns / 1.0e6,
+                 g_gpu_exec.dma_n, g_gpu_exec.dma_ns / 1.0e6,
+                 g_gpu_exec.other_n, g_gpu_exec.other_ns / 1.0e6);
+        // Per-cmdlist PICA register-write breakdown. `writes` is the number of
+        // WriteInternalReg invocations taking the slow (switch-dispatch) path;
+        // `burst_items` is items handled by the fast WriteBurstSameReg path,
+        // spread across `burst_invocations` runs (≈ items/invocation per run).
+        const auto pica_writes = Pica::GetAndResetPicaWriteProbe();
+        LOG_INFO(HW_GPU,
+                 "PicaWriteProbe writes={} burst_items={} burst_invocations={} "
+                 "avg_burst_len={:.1f}",
+                 pica_writes.writes_total, pica_writes.burst_items,
+                 pica_writes.burst_invocations,
+                 pica_writes.burst_invocations
+                     ? static_cast<double>(pica_writes.burst_items) /
+                           static_cast<double>(pica_writes.burst_invocations)
+                     : 0.0);
+        LOG_INFO(HW_GPU,
+                 "TexXferProbe tc[accel={} ({:.2f}ms) sw={} ({:.2f}ms)] "
+                 "dt[accel={} ({:.2f}ms) sw={} ({:.2f}ms)] "
+                 "mf[accel={} ({:.2f}ms) sw={} ({:.2f}ms)]",
+                 g_tex_xfer.accel_tc, g_tex_xfer.accel_tc_ns / 1.0e6,
+                 g_tex_xfer.sw_tc, g_tex_xfer.sw_tc_ns / 1.0e6,
+                 g_tex_xfer.accel_dt, g_tex_xfer.accel_dt_ns / 1.0e6,
+                 g_tex_xfer.sw_dt, g_tex_xfer.sw_dt_ns / 1.0e6,
+                 g_tex_xfer.accel_mf, g_tex_xfer.accel_mf_ns / 1.0e6,
+                 g_tex_xfer.sw_mf, g_tex_xfer.sw_mf_ns / 1.0e6);
+        g_gpu_exec = GpuExecCounters{};
+        g_tex_xfer = TexXferCounters{};
+    }
 
     // Reschedule recurrent event
     impl->timing.ScheduleEvent(FRAME_TICKS - cycles_late, impl->vblank_event);

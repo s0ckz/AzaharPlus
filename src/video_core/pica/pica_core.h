@@ -45,6 +45,15 @@ private:
 
     void WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requested);
 
+    // Batch-writes `count` words to `id` without re-dispatching through the
+    // WriteInternalReg switch on every iteration. Used by ProcessCmdList for
+    // bursts (header.extra_data_length > 0) targeting pure-data registers
+    // (LUT / uniform / program / swizzle uploads) where the per-iteration
+    // register effect is just "store + advance internal offset". Falls back
+    // to per-call WriteInternalReg for non-burst-safe IDs.
+    void WriteBurstSameReg(u32 id, const u32* values, u32 count, u32 mask,
+                           bool& stop_requested);
+
     void SubmitImmediate(u32 data);
 
     void DrawImmediate();
@@ -321,5 +330,15 @@ private:
 };
 
 #define GPU_REG_INDEX(field_name) (offsetof(Pica::PicaCore::Regs, field_name) / sizeof(u32))
+
+// PICA write probe: swap counters to the caller and reset to zero. Counters are
+// incremented from within ProcessCmdList on the emu thread; VBlankCallback reads
+// and resets them on the same thread, so no locking is required.
+struct PicaWriteProbeCounters {
+    std::uint64_t writes_total = 0;      // individual WriteInternalReg invocations
+    std::uint64_t burst_items = 0;       // items handled by WriteBurstSameReg fast path
+    std::uint64_t burst_invocations = 0; // times the burst fast path was entered
+};
+PicaWriteProbeCounters GetAndResetPicaWriteProbe();
 
 } // namespace Pica
