@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <type_traits>
 #include <boost/container/small_vector.hpp>
 #include <boost/range/iterator_range.hpp>
@@ -14,6 +15,7 @@
 #include "common/settings.h"
 #include "core/memory.h"
 #include "video_core/custom_textures/custom_tex_manager.h"
+#include "video_core/pica/pica_core.h"
 #include "video_core/pica/regs_external.h"
 #include "video_core/pica/regs_internal.h"
 #include "video_core/rasterizer_cache/rasterizer_cache_base.h"
@@ -169,12 +171,14 @@ bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig
     // Texture copy size is aligned to 16 byte units
     const u32 copy_size = Common::AlignDown(config.texture_copy.size, 16);
     if (copy_size == 0) {
+        Pica::IncTexCopyBailCopySizeZero();
         return false;
     }
 
     u32 input_gap = config.texture_copy.input_gap * 16;
     u32 input_width = config.texture_copy.input_width * 16;
     if (input_width == 0 && input_gap != 0) {
+        Pica::IncTexCopyBailInputWidthZero();
         return false;
     }
     if (input_gap == 0 || input_width >= copy_size) {
@@ -182,12 +186,14 @@ bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig
         input_gap = 0;
     }
     if (copy_size % input_width != 0) {
+        Pica::IncTexCopyBailCopyModInputWidth();
         return false;
     }
 
     u32 output_gap = config.texture_copy.output_gap * 16;
     u32 output_width = config.texture_copy.output_width * 16;
     if (output_width == 0 && output_gap != 0) {
+        Pica::IncTexCopyBailOutputWidthZero();
         return false;
     }
     if (output_gap == 0 || output_width >= copy_size) {
@@ -195,6 +201,7 @@ bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig
         output_gap = 0;
     }
     if (copy_size % output_width != 0) {
+        Pica::IncTexCopyBailCopyModOutputWidth();
         return false;
     }
 
@@ -208,6 +215,59 @@ bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig
 
     const auto [src_surface_id, src_rect] = GetTexCopySurface(src_params);
     if (!src_surface_id) {
+        Pica::IncTexCopyBailSrcSurfaceMiss();
+        // Rate-limited diagnostic: every second, dump the src params + up to
+        // 3 overlapping surfaces WITH the specific reason each one fails
+        // CanTexCopy. Lets us see exactly which geometric check needs
+        // loosening in surface_params.cpp without having to manually poke
+        // at address ranges.
+        static std::chrono::steady_clock::time_point s_last_log{};
+        const auto now = std::chrono::steady_clock::now();
+        if (now - s_last_log > std::chrono::seconds(1)) {
+            s_last_log = now;
+            LOG_INFO(HW_GPU,
+                     "TexCopyMiss src[addr={:#010x} size={} w={} stride={} h={}]",
+                     src_params.addr, src_params.size, src_params.width,
+                     src_params.stride, src_params.height);
+            u32 logged = 0;
+            const SurfaceInterval copy_iv = src_params.GetInterval();
+            ForEachSurfaceInRegion(src_params.addr, src_params.size,
+                                   [&](SurfaceId id, Surface& s) {
+                                       if (logged >= 3) {
+                                           return;
+                                       }
+                                       // Mirror CanTexCopy step-by-step and
+                                       // name the failing condition.
+                                       const char* reason = "accepts";
+                                       if (s.pixel_format == PixelFormat::Invalid) {
+                                           reason = "invalid_fmt";
+                                       } else if (s.addr > src_params.addr) {
+                                           reason = "surf.addr_after_src";
+                                       } else if (s.end < src_params.end) {
+                                           reason = "surf.end_before_src";
+                                       } else if (src_params.width != src_params.stride) {
+                                           reason = "strided(see_code)";
+                                       } else {
+                                           const u32 lvl = s.LevelOf(src_params.addr);
+                                           const auto lvl_iv = s.LevelInterval(lvl);
+                                           if ((lvl_iv & copy_iv) != copy_iv) {
+                                               reason = "level_iv_mismatch";
+                                           } else if (s.FromInterval(copy_iv).GetInterval() !=
+                                                      copy_iv) {
+                                               reason = "FromInterval_roundtrip";
+                                           }
+                                       }
+                                       LOG_INFO(HW_GPU,
+                                                "  #{} surf[addr={:#010x} end={:#010x} size={} "
+                                                "w={} stride={} h={} tiled={} fmt={} lvls={}] "
+                                                "reason={}",
+                                                logged, s.addr, s.end, s.size, s.width, s.stride,
+                                                s.height, s.is_tiled ? 1 : 0,
+                                                static_cast<u32>(s.pixel_format), s.levels,
+                                                reason);
+                                       ++logged;
+                                   });
+        }
         return false;
     }
 
@@ -216,6 +276,7 @@ bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig
         (output_width != src_info.BytesInPixels(src_rect.GetWidth() / src_info.res_scale) *
                              (src_info.is_tiled ? 8 : 1) ||
          output_gap % src_info.BytesInPixels(src_info.is_tiled ? 64 : 1) != 0)) {
+        Pica::IncTexCopyBailOutputGapMismatch();
         return false;
     }
 
@@ -233,6 +294,7 @@ bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig
     const auto [dst_surface_id, dst_rect] =
         GetSurfaceSubRect(dst_params, ScaleMatch::Upscale, load_gap);
     if (!dst_surface_id) {
+        Pica::IncTexCopyBailDstSurfaceMiss();
         return false;
     }
 
@@ -241,6 +303,7 @@ bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig
 
     if (dst_surface.type == SurfaceType::Texture ||
         !CheckFormatsBlittable(src_surface.pixel_format, dst_surface.pixel_format)) {
+        Pica::IncTexCopyBailDstNotBlittable();
         return false;
     }
 
@@ -249,6 +312,7 @@ bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig
             HW_GPU,
             "Surface source and destination width mismatch, skipping... src_width={}, dst_width={}",
             src_rect.GetWidth(), dst_rect.GetHeight());
+        Pica::IncTexCopyBailWidthMismatch();
         return false;
     }
 
@@ -262,6 +326,7 @@ bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig
     runtime.CopyTextures(src_surface, dst_surface, texture_copy);
 
     InvalidateRegion(dst_params.addr, dst_params.size, dst_surface_id);
+    Pica::IncTexCopyAccel();
     return true;
 }
 
@@ -1234,6 +1299,30 @@ void RasterizerCache<T>::ClearAll(bool flush) {
     cached_pages -= flush_interval;
     dirty_regions.clear();
     page_table.clear();
+}
+
+template <class T>
+SurfaceId RasterizerCache<T>::FindContainingSurface(PAddr addr, u32 size) {
+    // Walk surfaces overlapping the region and pick the largest one that fully
+    // contains [addr, addr+size). "Largest" is the tiebreaker when multiple
+    // surfaces cover the range (common for VRAM where an old small surface and
+    // a new larger surface coexist briefly).
+    SurfaceId best{};
+    u32 best_size = 0;
+    const PAddr end = addr + size;
+    ForEachSurfaceInRegion(addr, size, [&](SurfaceId id, Surface& s) {
+        if (s.pixel_format == PixelFormat::Invalid) {
+            return;
+        }
+        if (!(s.addr <= addr && s.end >= end)) {
+            return;
+        }
+        if (s.size > best_size) {
+            best = id;
+            best_size = s.size;
+        }
+    });
+    return best;
 }
 
 template <class T>

@@ -5,6 +5,7 @@
 #pragma once
 
 #include "video_core/rasterizer_accelerated.h"
+#include "video_core/rasterizer_cache/surface_params.h"
 #include "video_core/renderer_vulkan/vk_descriptor_update_queue.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_render_manager.h"
@@ -56,6 +57,7 @@ public:
     void ClearAll(bool flush) override;
     bool AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) override;
     bool AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) override;
+    bool TryDeferredTextureCopy(const Pica::DisplayTransferConfig& config) override;
     bool AccelerateFill(const Pica::MemoryFillConfig& config) override;
     bool AccelerateDisplay(const Pica::FramebufferConfig& config, PAddr framebuffer_addr,
                            u32 pixel_stride, ScreenInfo& screen_info);
@@ -155,6 +157,31 @@ private:
     std::array<vk::ImageView, 3> cached_tex_views{};
     std::array<vk::Sampler, 3> cached_tex_samplers{};
     u64 tex_cache_tick{0};
+
+    // Deferred software-TextureCopy queue (Fix B). Each entry records an
+    // in-flight readback whose memcpy was postponed; drained at TickFrame or
+    // when something touches the destination region.
+    struct DeferredSwTc {
+        u64 fence_tick;              // scheduler tick to wait on
+        u8* staging_mapped;          // host-visible buffer with downloaded data
+        u32 staging_size;
+        VideoCore::SurfaceParams src_params; // for EncodeTexture re-swizzle
+        PAddr flush_start;           // inside src_params surface; EncodeTexture start
+        PAddr flush_end;             // EncodeTexture end
+        bool needs_conversion;
+        PAddr dst_addr;              // memcpy destination
+        u32 dst_size;                // contiguous copy size (bytes)
+    };
+    std::vector<DeferredSwTc> pending_sw_tc;
+
+    // Drain all entries whose [dst_addr, dst_addr+dst_size) overlaps [addr, addr+size).
+    // Called from FlushRegion/InvalidateRegion/FlushAndInvalidateRegion before they
+    // consult the rasterizer cache so those queries see correct CPU memory.
+    void DrainDeferredSwTcOverlapping(PAddr addr, u32 size);
+    // Drain everything. Called from TickFrame + ClearAll.
+    void DrainAllDeferredSwTc();
+    // Worker: perform one drain entry (wait, memcpy, invalidate).
+    void PerformDeferredSwTc(DeferredSwTc& entry);
 };
 
 } // namespace Vulkan

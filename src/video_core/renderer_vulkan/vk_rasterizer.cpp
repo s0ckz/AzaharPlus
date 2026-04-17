@@ -12,6 +12,7 @@
 #include "core/loader/loader.h"
 #include "core/memory.h"
 #include "video_core/pica/pica_core.h"
+#include "video_core/rasterizer_cache/utils.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -140,6 +141,11 @@ RasterizerVulkan::RasterizerVulkan(Memory::MemorySystem& memory, Pica::PicaCore&
 RasterizerVulkan::~RasterizerVulkan() = default;
 
 void RasterizerVulkan::TickFrame() {
+    // Drain any deferred sw-TextureCopy memcpys queued from last frame. By now
+    // their submission ticks should have long since signaled — the Wait is
+    // effectively a no-op — so the remaining work is just the Morton-swizzle
+    // + InvalidateRegion, off the per-frame hot path.
+    DrainAllDeferredSwTc();
     res_cache.TickFrame();
 }
 
@@ -805,23 +811,28 @@ void RasterizerVulkan::BindTextureCube(const Pica::TexturingRegs::FullTextureCon
 }
 
 void RasterizerVulkan::FlushAll() {
+    DrainAllDeferredSwTc();
     res_cache.FlushAll();
 }
 
 void RasterizerVulkan::FlushRegion(PAddr addr, u32 size) {
+    DrainDeferredSwTcOverlapping(addr, size);
     res_cache.FlushRegion(addr, size);
 }
 
 void RasterizerVulkan::InvalidateRegion(PAddr addr, u32 size) {
+    DrainDeferredSwTcOverlapping(addr, size);
     res_cache.InvalidateRegion(addr, size);
 }
 
 void RasterizerVulkan::FlushAndInvalidateRegion(PAddr addr, u32 size) {
+    DrainDeferredSwTcOverlapping(addr, size);
     res_cache.FlushRegion(addr, size);
     res_cache.InvalidateRegion(addr, size);
 }
 
 void RasterizerVulkan::ClearAll(bool flush) {
+    DrainAllDeferredSwTc();
     res_cache.ClearAll(flush);
 }
 
@@ -831,6 +842,152 @@ bool RasterizerVulkan::AccelerateDisplayTransfer(const Pica::DisplayTransferConf
 
 bool RasterizerVulkan::AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) {
     return res_cache.AccelerateTextureCopy(config);
+}
+
+bool RasterizerVulkan::TryDeferredTextureCopy(const Pica::DisplayTransferConfig& config) {
+    // Deferred sw-TextureCopy (Fix B). When the geometric AccelerateTextureCopy
+    // has just rejected the copy (falling through to SwBlitter), we may still
+    // be able to handle it without the ~15 ms CPU stall inside scheduler.Finish
+    // by:
+    //   1. Locating a cached source surface that fully contains the byte range,
+    //   2. Issuing the GPU->CPU readback non-blocking via Surface::DownloadAsync,
+    //   3. Queuing the memcpy (actually a Morton-swizzle EncodeTexture write
+    //      directly into the destination's CPU memory) for later when the fence
+    //      has naturally signaled,
+    //   4. Draining at TickFrame or whenever anything touches the destination.
+    //
+    // Scope limit (first cut): only contiguous copies (no strides). That covers
+    // MK7's hot 128 KB linear-in-tiled-surface case. The general strided case
+    // still falls through to the blocking SwBlitter path.
+    const u32 copy_size = Common::AlignDown(config.texture_copy.size, 16);
+    if (copy_size == 0) {
+        return false;
+    }
+    const u32 input_gap = config.texture_copy.input_gap * 16;
+    const u32 output_gap = config.texture_copy.output_gap * 16;
+    if (input_gap != 0 || output_gap != 0) {
+        return false;
+    }
+
+    const PAddr src_addr = config.GetPhysicalInputAddress();
+    const PAddr dst_addr = config.GetPhysicalOutputAddress();
+
+    // Before issuing a new deferred copy, drain any pending entries whose dst
+    // overlaps our src (could mean we'd read stale CPU data) or whose dst
+    // overlaps our dst (we're about to overwrite what they staged).
+    DrainDeferredSwTcOverlapping(src_addr, copy_size);
+    DrainDeferredSwTcOverlapping(dst_addr, copy_size);
+
+    const VideoCore::SurfaceId src_id = res_cache.FindContainingSurface(src_addr, copy_size);
+    if (!src_id) {
+        return false;
+    }
+    Surface& src_surface = res_cache.GetSurface(src_id);
+    if (src_surface.type == VideoCore::SurfaceType::Fill ||
+        src_surface.pixel_format == VideoCore::PixelFormat::Invalid) {
+        return false;
+    }
+
+    // Build a SurfaceParams that covers the byte range, aligned to tile-row
+    // boundaries of the containing surface. EncodeTexture will re-swizzle
+    // detiled pixels back to tiled bytes at the destination.
+    const u32 bytes_per_pixel = src_surface.GetInternalBytesPerPixel();
+    const u32 tile_h = src_surface.is_tiled ? 8u : 1u;
+    const u32 row_bytes = src_surface.stride * bytes_per_pixel * tile_h;
+    if (row_bytes == 0) {
+        return false;
+    }
+    const PAddr src_end = src_addr + copy_size;
+    const u32 offset_in_surface = src_addr - src_surface.addr;
+    // Tile-row aligned sub-rectangle covering [src_addr, src_end).
+    const u32 first_tile_row = offset_in_surface / row_bytes;
+    const u32 last_tile_row = (src_end - 1 - src_surface.addr) / row_bytes;
+    const u32 sub_tile_rows = last_tile_row - first_tile_row + 1;
+    const u32 sub_height_px = sub_tile_rows * tile_h;
+    const u32 sub_width_px = src_surface.stride;
+    const PAddr sub_addr = src_surface.addr + first_tile_row * row_bytes;
+    // Staging size in pixels × internal BPP (detiled layout).
+    const u32 staging_bytes = sub_width_px * sub_height_px * bytes_per_pixel;
+
+    const VideoCore::StagingData staging =
+        runtime.FindStaging(staging_bytes, /*upload=*/false);
+    if (!staging.mapped.data()) {
+        return false;
+    }
+
+    VideoCore::SurfaceParams flush_info = src_surface;
+    flush_info.addr = sub_addr;
+    flush_info.width = sub_width_px;
+    flush_info.height = sub_height_px;
+    flush_info.stride = sub_width_px;
+    flush_info.levels = 1;
+    flush_info.UpdateParams();
+
+    const VideoCore::BufferTextureCopy download = {
+        .buffer_offset = staging.offset,
+        .buffer_size = staging.size,
+        .texture_rect = src_surface.GetSubRect(flush_info),
+        .texture_level = 0,
+    };
+
+    const u64 tick = src_surface.DownloadAsync(download, staging);
+
+    DeferredSwTc entry{
+        .fence_tick = tick,
+        .staging_mapped = staging.mapped.data(),
+        .staging_size = static_cast<u32>(staging.size),
+        .src_params = flush_info,
+        .flush_start = src_addr,
+        .flush_end = src_end,
+        .needs_conversion = runtime.NeedsConversion(src_surface.pixel_format),
+        .dst_addr = dst_addr,
+        .dst_size = copy_size,
+    };
+    pending_sw_tc.push_back(entry);
+    return true;
+}
+
+void RasterizerVulkan::PerformDeferredSwTc(DeferredSwTc& entry) {
+    scheduler.Wait(entry.fence_tick);
+    MemoryRef dst_ref = memory.GetPhysicalRef(entry.dst_addr);
+    if (!dst_ref) {
+        return;
+    }
+    const auto dst_bytes = dst_ref.GetWriteBytes(entry.dst_size);
+    // EncodeTexture re-swizzles detiled pixels from staging back into the tiled
+    // byte layout described by entry.src_params, offset by (flush_start -
+    // src_params.addr). Pointing `dest` at dst_bytes produces the same tiled
+    // byte pattern the game expects at its destination address — bit-identical
+    // to the source bytes, because this is just round-trip detile-then-retile.
+    VideoCore::EncodeTexture(entry.src_params, entry.flush_start, entry.flush_end,
+                             std::span<u8>(entry.staging_mapped, entry.staging_size),
+                             dst_bytes, entry.needs_conversion);
+    res_cache.InvalidateRegion(entry.dst_addr, entry.dst_size);
+    runtime.CommitDownload(entry.staging_size);
+}
+
+void RasterizerVulkan::DrainDeferredSwTcOverlapping(PAddr addr, u32 size) {
+    if (pending_sw_tc.empty()) {
+        return;
+    }
+    const PAddr end = addr + size;
+    for (auto it = pending_sw_tc.begin(); it != pending_sw_tc.end();) {
+        const PAddr e_end = it->dst_addr + it->dst_size;
+        const bool overlaps = it->dst_addr < end && addr < e_end;
+        if (overlaps) {
+            PerformDeferredSwTc(*it);
+            it = pending_sw_tc.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void RasterizerVulkan::DrainAllDeferredSwTc() {
+    for (auto& entry : pending_sw_tc) {
+        PerformDeferredSwTc(entry);
+    }
+    pending_sw_tc.clear();
 }
 
 bool RasterizerVulkan::AccelerateFill(const Pica::MemoryFillConfig& config) {

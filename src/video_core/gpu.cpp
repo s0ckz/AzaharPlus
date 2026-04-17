@@ -555,6 +555,31 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
                  hit_rate(drawopt.tex_cache_skip, drawopt.tex_cache_full),
                  drawopt.bind_desc_skip, drawopt.bind_desc_full,
                  hit_rate(drawopt.bind_desc_skip, drawopt.bind_desc_full));
+        // TexCopyBailProbe: per-reason counts for AccelerateTextureCopy's 10
+        // return-false paths. The reason with the dominant count identifies
+        // which fix is worth chasing — 14 ms/frame of sw-TextureCopy in MK7
+        // all pours through one of these.
+        const auto tcb = Pica::GetAndResetTexCopyProbe();
+        LOG_INFO(HW_GPU,
+                 "TexCopyBail accel={} cs0={} iw0={} cs%iw={} ow0={} cs%ow={} "
+                 "src_miss={} ogap={} dst_miss={} dst_bad_fmt={} w_mm={}",
+                 tcb.accel, tcb.copy_size_zero, tcb.input_width_zero,
+                 tcb.copy_mod_input_width, tcb.output_width_zero,
+                 tcb.copy_mod_output_width, tcb.src_surface_miss,
+                 tcb.output_gap_mismatch, tcb.dst_surface_miss,
+                 tcb.dst_not_blittable, tcb.width_mismatch);
+        // SwTexCopy phase split: per-second totals for Flush (GPU->CPU
+        // readback), memcpy (pure CPU copy), Invalidate (cache bookkeeping),
+        // and bytes moved. The dominant ms pins the fix target.
+        const auto swtc = Pica::GetAndResetSwTexCopyProbe();
+        LOG_INFO(HW_GPU,
+                 "SwTexCopyProbe calls={} flush={:.2f}ms memcpy={:.2f}ms "
+                 "invalidate={:.2f}ms bytes={} ({:.1f} MB/s)",
+                 swtc.calls, swtc.flush_ns / 1.0e6, swtc.memcpy_ns / 1.0e6,
+                 swtc.invalidate_ns / 1.0e6, swtc.total_bytes,
+                 swtc.memcpy_ns
+                     ? (swtc.total_bytes / (swtc.memcpy_ns / 1.0e9)) / (1024.0 * 1024.0)
+                     : 0.0);
         LOG_INFO(HW_GPU,
                  "TexXferProbe tc[accel={} ({:.2f}ms) sw={} ({:.2f}ms)] "
                  "dt[accel={} ({:.2f}ms) sw={} ({:.2f}ms)] "

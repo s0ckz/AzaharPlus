@@ -2,10 +2,12 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <chrono>
 #include "common/alignment.h"
 #include "common/color.h"
 #include "common/vector_math.h"
 #include "core/memory.h"
+#include "video_core/pica/pica_core.h"
 #include "video_core/pica/regs_external.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_software/sw_blitter.h"
@@ -51,6 +53,15 @@ void SwBlitter::TextureCopy(const Pica::DisplayTransferConfig& config) {
         return;
     }
 
+    // Try the deferred / async path first. When the source is a GPU-resident
+    // render target, the default blocking flush stalls the CPU ~15 ms (MK7
+    // heavy scene) waiting for prior draw commands to finish before the
+    // readback fence signals. The deferred path issues the readback
+    // non-blocking and memcpys lazily when the data is actually consumed.
+    if (rasterizer->TryDeferredTextureCopy(config)) {
+        return;
+    }
+
     u8* src_pointer = memory.GetPhysicalPointer(src_addr);
     u8* dst_pointer = memory.GetPhysicalPointer(dst_addr);
 
@@ -80,8 +91,10 @@ void SwBlitter::TextureCopy(const Pica::DisplayTransferConfig& config) {
 
     const std::size_t contiguous_input_size =
         config.texture_copy.size / input_width * (input_width + input_gap);
+    const auto t_flush = std::chrono::steady_clock::now();
     rasterizer->FlushRegion(config.GetPhysicalInputAddress(),
                             static_cast<u32>(contiguous_input_size));
+    const auto t_after_flush = std::chrono::steady_clock::now();
 
     const std::size_t contiguous_output_size =
         config.texture_copy.size / output_width * (output_width + output_gap);
@@ -92,13 +105,16 @@ void SwBlitter::TextureCopy(const Pica::DisplayTransferConfig& config) {
     } else {
         rasterizer->InvalidateRegion(dst_addr, static_cast<u32>(contiguous_output_size));
     }
+    const auto t_after_invalidate = std::chrono::steady_clock::now();
 
     u32 remaining_input = input_width;
     u32 remaining_output = output_width;
+    std::uint64_t copied_bytes = 0;
     while (remaining_size > 0) {
         u32 copy_size = std::min({remaining_input, remaining_output, remaining_size});
 
         std::memcpy(dst_pointer, src_pointer, copy_size);
+        copied_bytes += copy_size;
         src_pointer += copy_size;
         dst_pointer += copy_size;
 
@@ -115,6 +131,18 @@ void SwBlitter::TextureCopy(const Pica::DisplayTransferConfig& config) {
             dst_pointer += output_gap;
         }
     }
+    const auto t_after_memcpy = std::chrono::steady_clock::now();
+
+    const auto to_ns = [](auto delta) {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(delta).count());
+    };
+    // Note on ordering: the original code runs Invalidate BEFORE the memcpy
+    // loop, so timestamps are flush -> invalidate -> memcpy. Preserved here
+    // so the probe reflects actual phase order.
+    Pica::AddSwTexCopyCall(to_ns(t_after_flush - t_flush),
+                           to_ns(t_after_memcpy - t_after_invalidate),
+                           to_ns(t_after_invalidate - t_after_flush), copied_bytes);
 }
 
 void SwBlitter::DisplayTransfer(const Pica::DisplayTransferConfig& config) {
