@@ -4,7 +4,6 @@
 
 #pragma once
 
-#include <cstdint>
 #include "common/common_types.h"
 #include "core/hle/service/gsp/gsp_interrupt.h"
 #include "video_core/pica/dirty_regs.h"
@@ -27,29 +26,6 @@ class RasterizerInterface;
 
 namespace Pica {
 
-// Diagnostic probe to decompose PicaCore::ProcessCmdList into its internal
-// sub-phases. The 1Hz log dump in GPU::VBlankCallback reads these via
-// GetCmdListProbe() / ResetCmdListProbe(). No locking: all updates happen on
-// the GSP service thread under the same implicit serialization perf_stats
-// relies on, and the reset races with the next cmdlist batch at most once
-// per log interval, which only skews 1 line of output.
-struct CmdListProbe {
-    // Total wall-ns across all ProcessCmdList() invocations (the same wall
-    // time that the outer GpuExecProbe `cmdlist` bucket reports).
-    std::uint64_t cmdlists_n = 0;
-    std::uint64_t cmdlists_ns = 0;
-    // Wall-ns spent inside DrawArrays() triggers (a sub-bucket of cmdlists_ns).
-    // If this dominates, the cost is in rasterizer state upload and geometry
-    // pipeline dispatch — NOT the register-walking loop.
-    std::uint64_t draws_n = 0;
-    std::uint64_t draws_ns = 0;
-    // Number of WriteInternalReg() invocations across all cmdlists. Divide
-    // cmdlists_ns-draws_ns by this to get per-regwrite cost in ns.
-    std::uint64_t regwrites_n = 0;
-};
-CmdListProbe GetCmdListProbe();
-void ResetCmdListProbe();
-
 class DebugContext;
 class ShaderEngine;
 
@@ -67,12 +43,16 @@ public:
 private:
     void InitializeRegs();
 
-    // Slow path for side-effect-triggering register writes. Only called by
-    // ProcessCmdList's hot loop when the register ID is set in the compile-
-    // time action bitset. The read-modify-write on reg_array and the dirty
-    // bit are already applied by the caller BEFORE this runs, so the switch
-    // inside only handles side effects.
-    void WriteInternalRegAction(u32 id, u32 value, u32 mask, bool& stop_requested);
+    void WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requested);
+
+    // Batch-writes `count` words to `id` without re-dispatching through the
+    // WriteInternalReg switch on every iteration. Used by ProcessCmdList for
+    // bursts (header.extra_data_length > 0) targeting pure-data registers
+    // (LUT / uniform / program / swizzle uploads) where the per-iteration
+    // register effect is just "store + advance internal offset". Falls back
+    // to per-call WriteInternalReg for non-burst-safe IDs.
+    void WriteBurstSameReg(u32 id, const u32* values, u32 count, u32 mask,
+                           bool& stop_requested);
 
     void SubmitImmediate(u32 data);
 
@@ -350,5 +330,57 @@ private:
 };
 
 #define GPU_REG_INDEX(field_name) (offsetof(Pica::PicaCore::Regs, field_name) / sizeof(u32))
+
+// PICA write probe: swap counters to the caller and reset to zero. Counters are
+// incremented from within ProcessCmdList on the emu thread; VBlankCallback reads
+// and resets them on the same thread, so no locking is required.
+struct PicaWriteProbeCounters {
+    std::uint64_t writes_total = 0;      // individual WriteInternalReg invocations
+    std::uint64_t burst_items = 0;       // items handled by WriteBurstSameReg fast path
+    std::uint64_t burst_invocations = 0; // times the burst fast path was entered
+    std::uint64_t fast_single = 0;       // single writes short-circuited in-line
+                                         // (default-case regs: merge + dirty, no switch)
+};
+PicaWriteProbeCounters GetAndResetPicaWriteProbe();
+
+// Attribution of time spent inside PicaCore::DrawArrays / DrawImmediate.
+// `accel_*` = AccelerateDrawBatch accepted the draw (hw-shader path).
+// `cpu_*`   = fallback via LoadVertices (CPU runs the PICA vertex shader per
+//             vertex, then rasterizer->DrawTriangles() submits triangles).
+// `imm_*`   = immediate-mode draws (DrawImmediate). Typically rare; 3DS
+//             games mostly use indexed/array draws.
+// `vertices_accel` / `vertices_cpu` = pipeline.num_vertices summed per path
+// so we can see if CPU-fallback draws are also vertex-heavy.
+struct DrawProbeCounters {
+    std::uint64_t accel_n = 0;
+    std::uint64_t accel_ns = 0;
+    std::uint64_t cpu_n = 0;
+    std::uint64_t cpu_ns = 0;
+    std::uint64_t imm_n = 0;
+    std::uint64_t imm_ns = 0;
+    std::uint64_t vertices_accel = 0;
+    std::uint64_t vertices_cpu = 0;
+};
+DrawProbeCounters GetAndResetDrawProbe();
+
+// Draw-call optimization counters (Vulkan renderer). Each `_skip` counter
+// increments when the corresponding shortcut fired; each `_full` counter
+// tracks cache misses / first-use paths. Written from vk_rasterizer.cpp on
+// the emu thread; read+reset from VBlankCallback on the same thread.
+struct DrawOptProbeCounters {
+    std::uint64_t sync_state_skip = 0;    // SyncDrawState skipped (dirty-regs clean)
+    std::uint64_t sync_state_full = 0;    // SyncDrawState rebuilt pipeline_info
+    std::uint64_t tex_cache_skip = 0;     // SyncTextureUnits reused descriptor set
+    std::uint64_t tex_cache_full = 0;     // SyncTextureUnits acquired new set
+    std::uint64_t bind_desc_skip = 0;     // BindPipeline skipped bindDescriptorSets
+    std::uint64_t bind_desc_full = 0;     // BindPipeline issued bindDescriptorSets
+};
+DrawOptProbeCounters GetAndResetDrawOptProbe();
+void IncDrawOptSyncStateSkip();
+void IncDrawOptSyncStateFull();
+void IncDrawOptTexCacheSkip();
+void IncDrawOptTexCacheFull();
+void IncDrawOptBindDescSkip();
+void IncDrawOptBindDescFull();
 
 } // namespace Pica

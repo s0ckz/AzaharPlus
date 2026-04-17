@@ -155,6 +155,15 @@ private:
     std::array<vk::DescriptorSet, NumRasterizerSets> bound_descriptor_sets{};
     std::array<u32, NumDynamicOffsets> offsets{};
 
+    // Last-submitted descriptor set binding state (optimization C). When the
+    // incoming (bound_descriptor_sets, offsets) tuple matches and the scheduler
+    // hasn't marked DescriptorSets dirty, skip the per-draw
+    // cmdbuf.bindDescriptorSets call — Vulkan's binding model preserves the
+    // previously-bound sets across pipeline binds that share the same layout.
+    std::array<vk::DescriptorSet, NumRasterizerSets> last_bound_descriptor_sets{};
+    std::array<u32, NumDynamicOffsets> last_offsets{};
+    bool last_bound_valid{false};
+
     std::array<u64, MAX_SHADER_STAGES> shader_hashes;
     std::array<Shader*, MAX_SHADER_STAGES> current_shaders;
 

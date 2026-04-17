@@ -18,157 +18,6 @@
 
 namespace Pica {
 
-namespace {
-CmdListProbe g_cmdlist_probe;
-
-inline std::uint64_t NanosSince(std::chrono::steady_clock::time_point t0) {
-    return static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
-            .count());
-}
-
-// Bitset of PICA internal register IDs that have a side effect beyond a plain
-// register_array write + dirty-bit set. Built at program startup from exactly
-// the list of `case PICA_REG_INDEX(...)` labels that appear in
-// WriteInternalReg's switch statement below — any drift between the two is
-// caught at debug-asserts in WriteInternalReg.
-//
-// Why: simpleperf measured PicaCore::WriteInternalReg as the single hottest
-// function in the emulator (7.5% of total cycles). ~49,000 register writes
-// per rendered frame in SMB3DL, of which ~95% fall to the switch's `default:`
-// branch and only do the RMW + dirty bit. Paying the jump-table dispatch +
-// function-call overhead for the common case is wasted work; bypassing the
-// switch on inert IDs is a pure win.
-constexpr std::size_t kNumRegs = RegsInternal::NUM_REGS;
-constexpr std::size_t kBitsetWords = (kNumRegs + 63) / 64;
-
-// Using function-local static instead of constexpr because offsetof on
-// PICA_REG_INDEX's nested union types isn't guaranteed constexpr across
-// compilers. One-time cost at program startup.
-const std::array<std::uint64_t, kBitsetWords>& GetActionBitset() {
-    static const std::array<std::uint64_t, kBitsetWords> kBitset = [] {
-        std::array<std::uint64_t, kBitsetWords> bits{};
-        const auto set_bit = [&bits](std::uint32_t id) {
-            bits[id >> 6] |= (1ULL << (id & 63));
-        };
-
-        set_bit(PICA_REG_INDEX(irq_request));
-        set_bit(PICA_REG_INDEX(pipeline.triangle_topology));
-        set_bit(PICA_REG_INDEX(pipeline.restart_primitive));
-        set_bit(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.index));
-        set_bit(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[0]));
-        set_bit(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[1]));
-        set_bit(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[2]));
-        set_bit(PICA_REG_INDEX(pipeline.gpu_mode));
-        set_bit(PICA_REG_INDEX(pipeline.command_buffer.trigger[0]));
-        set_bit(PICA_REG_INDEX(pipeline.command_buffer.trigger[1]));
-        set_bit(PICA_REG_INDEX(pipeline.trigger_draw));
-        set_bit(PICA_REG_INDEX(pipeline.trigger_draw_indexed));
-        set_bit(PICA_REG_INDEX(gs.bool_uniforms));
-        set_bit(PICA_REG_INDEX(gs.int_uniforms[0]));
-        set_bit(PICA_REG_INDEX(gs.int_uniforms[1]));
-        set_bit(PICA_REG_INDEX(gs.int_uniforms[2]));
-        set_bit(PICA_REG_INDEX(gs.int_uniforms[3]));
-        set_bit(PICA_REG_INDEX(gs.uniform_setup.set_value[0]));
-        set_bit(PICA_REG_INDEX(gs.uniform_setup.set_value[1]));
-        set_bit(PICA_REG_INDEX(gs.uniform_setup.set_value[2]));
-        set_bit(PICA_REG_INDEX(gs.uniform_setup.set_value[3]));
-        set_bit(PICA_REG_INDEX(gs.uniform_setup.set_value[4]));
-        set_bit(PICA_REG_INDEX(gs.uniform_setup.set_value[5]));
-        set_bit(PICA_REG_INDEX(gs.uniform_setup.set_value[6]));
-        set_bit(PICA_REG_INDEX(gs.uniform_setup.set_value[7]));
-        set_bit(PICA_REG_INDEX(gs.program.set_word[0]));
-        set_bit(PICA_REG_INDEX(gs.program.set_word[1]));
-        set_bit(PICA_REG_INDEX(gs.program.set_word[2]));
-        set_bit(PICA_REG_INDEX(gs.program.set_word[3]));
-        set_bit(PICA_REG_INDEX(gs.program.set_word[4]));
-        set_bit(PICA_REG_INDEX(gs.program.set_word[5]));
-        set_bit(PICA_REG_INDEX(gs.program.set_word[6]));
-        set_bit(PICA_REG_INDEX(gs.program.set_word[7]));
-        set_bit(PICA_REG_INDEX(gs.swizzle_patterns.set_word[0]));
-        set_bit(PICA_REG_INDEX(gs.swizzle_patterns.set_word[1]));
-        set_bit(PICA_REG_INDEX(gs.swizzle_patterns.set_word[2]));
-        set_bit(PICA_REG_INDEX(gs.swizzle_patterns.set_word[3]));
-        set_bit(PICA_REG_INDEX(gs.swizzle_patterns.set_word[4]));
-        set_bit(PICA_REG_INDEX(gs.swizzle_patterns.set_word[5]));
-        set_bit(PICA_REG_INDEX(gs.swizzle_patterns.set_word[6]));
-        set_bit(PICA_REG_INDEX(gs.swizzle_patterns.set_word[7]));
-        set_bit(PICA_REG_INDEX(vs.output_mask));
-        set_bit(PICA_REG_INDEX(vs.bool_uniforms));
-        set_bit(PICA_REG_INDEX(vs.int_uniforms[0]));
-        set_bit(PICA_REG_INDEX(vs.int_uniforms[1]));
-        set_bit(PICA_REG_INDEX(vs.int_uniforms[2]));
-        set_bit(PICA_REG_INDEX(vs.int_uniforms[3]));
-        set_bit(PICA_REG_INDEX(vs.uniform_setup.set_value[0]));
-        set_bit(PICA_REG_INDEX(vs.uniform_setup.set_value[1]));
-        set_bit(PICA_REG_INDEX(vs.uniform_setup.set_value[2]));
-        set_bit(PICA_REG_INDEX(vs.uniform_setup.set_value[3]));
-        set_bit(PICA_REG_INDEX(vs.uniform_setup.set_value[4]));
-        set_bit(PICA_REG_INDEX(vs.uniform_setup.set_value[5]));
-        set_bit(PICA_REG_INDEX(vs.uniform_setup.set_value[6]));
-        set_bit(PICA_REG_INDEX(vs.uniform_setup.set_value[7]));
-        set_bit(PICA_REG_INDEX(vs.program.set_word[0]));
-        set_bit(PICA_REG_INDEX(vs.program.set_word[1]));
-        set_bit(PICA_REG_INDEX(vs.program.set_word[2]));
-        set_bit(PICA_REG_INDEX(vs.program.set_word[3]));
-        set_bit(PICA_REG_INDEX(vs.program.set_word[4]));
-        set_bit(PICA_REG_INDEX(vs.program.set_word[5]));
-        set_bit(PICA_REG_INDEX(vs.program.set_word[6]));
-        set_bit(PICA_REG_INDEX(vs.program.set_word[7]));
-        set_bit(PICA_REG_INDEX(vs.swizzle_patterns.set_word[0]));
-        set_bit(PICA_REG_INDEX(vs.swizzle_patterns.set_word[1]));
-        set_bit(PICA_REG_INDEX(vs.swizzle_patterns.set_word[2]));
-        set_bit(PICA_REG_INDEX(vs.swizzle_patterns.set_word[3]));
-        set_bit(PICA_REG_INDEX(vs.swizzle_patterns.set_word[4]));
-        set_bit(PICA_REG_INDEX(vs.swizzle_patterns.set_word[5]));
-        set_bit(PICA_REG_INDEX(vs.swizzle_patterns.set_word[6]));
-        set_bit(PICA_REG_INDEX(vs.swizzle_patterns.set_word[7]));
-        set_bit(PICA_REG_INDEX(lighting.lut_data[0]));
-        set_bit(PICA_REG_INDEX(lighting.lut_data[1]));
-        set_bit(PICA_REG_INDEX(lighting.lut_data[2]));
-        set_bit(PICA_REG_INDEX(lighting.lut_data[3]));
-        set_bit(PICA_REG_INDEX(lighting.lut_data[4]));
-        set_bit(PICA_REG_INDEX(lighting.lut_data[5]));
-        set_bit(PICA_REG_INDEX(lighting.lut_data[6]));
-        set_bit(PICA_REG_INDEX(lighting.lut_data[7]));
-        set_bit(PICA_REG_INDEX(texturing.fog_lut_data[0]));
-        set_bit(PICA_REG_INDEX(texturing.fog_lut_data[1]));
-        set_bit(PICA_REG_INDEX(texturing.fog_lut_data[2]));
-        set_bit(PICA_REG_INDEX(texturing.fog_lut_data[3]));
-        set_bit(PICA_REG_INDEX(texturing.fog_lut_data[4]));
-        set_bit(PICA_REG_INDEX(texturing.fog_lut_data[5]));
-        set_bit(PICA_REG_INDEX(texturing.fog_lut_data[6]));
-        set_bit(PICA_REG_INDEX(texturing.fog_lut_data[7]));
-        set_bit(PICA_REG_INDEX(texturing.proctex_lut_data[0]));
-        set_bit(PICA_REG_INDEX(texturing.proctex_lut_data[1]));
-        set_bit(PICA_REG_INDEX(texturing.proctex_lut_data[2]));
-        set_bit(PICA_REG_INDEX(texturing.proctex_lut_data[3]));
-        set_bit(PICA_REG_INDEX(texturing.proctex_lut_data[4]));
-        set_bit(PICA_REG_INDEX(texturing.proctex_lut_data[5]));
-        set_bit(PICA_REG_INDEX(texturing.proctex_lut_data[6]));
-        set_bit(PICA_REG_INDEX(texturing.proctex_lut_data[7]));
-        return bits;
-    }();
-    return kBitset;
-}
-
-// Cached raw pointer to the bitset words for hot-path access without
-// re-running the function-local static guard each call.
-const std::uint64_t* const g_action_bitset = GetActionBitset().data();
-
-inline bool IsActionRegister(std::uint32_t id) {
-    return (g_action_bitset[id >> 6] >> (id & 63)) & 1ULL;
-}
-} // namespace
-
-CmdListProbe GetCmdListProbe() {
-    return g_cmdlist_probe;
-}
-
-void ResetCmdListProbe() {
-    g_cmdlist_probe = {};
-}
-
 MICROPROFILE_DEFINE(GPU_Drawing, "GPU", "Drawing", MP_RGB(50, 50, 240));
 
 using namespace DebugUtils;
@@ -181,6 +30,253 @@ union CommandHeader {
     BitField<31, 1, u32> group_commands;
 };
 static_assert(sizeof(CommandHeader) == sizeof(u32), "CommandHeader has incorrect size!");
+
+namespace {
+// Expand a 4-bit mask to 4-byte mask, e.g. 0b0101 -> 0x00FF00FF. Hoisted to file
+// scope so both WriteInternalReg (single-write path) and WriteBurstSameReg (burst
+// fast path) share a single table without re-initializing a local constexpr array.
+constexpr std::array<u32, 16> ExpandBitsToBytes = {
+    0x00000000, 0x000000ff, 0x0000ff00, 0x0000ffff, 0x00ff0000, 0x00ff00ff,
+    0x00ffff00, 0x00ffffff, 0xff000000, 0xff0000ff, 0xff00ff00, 0xff00ffff,
+    0xffff0000, 0xffff00ff, 0xffffff00, 0xffffffff,
+};
+
+// PicaWriteProbe counters. Mutated on the emu thread inside ProcessCmdList and
+// reset on the same thread from VBlankCallback — no locking required.
+std::uint64_t g_pica_writes_total = 0;
+std::uint64_t g_pica_burst_items = 0;
+std::uint64_t g_pica_burst_invocations = 0;
+std::uint64_t g_pica_fast_single = 0;
+
+// DrawProbe counters. Same thread affinity as the write counters above.
+std::uint64_t g_draw_accel_n = 0;
+std::uint64_t g_draw_accel_ns = 0;
+std::uint64_t g_draw_cpu_n = 0;
+std::uint64_t g_draw_cpu_ns = 0;
+std::uint64_t g_draw_imm_n = 0;
+std::uint64_t g_draw_imm_ns = 0;
+std::uint64_t g_draw_vertices_accel = 0;
+std::uint64_t g_draw_vertices_cpu = 0;
+
+// DrawOptProbe counters (Vulkan rasterizer shortcuts).
+std::uint64_t g_drawopt_sync_skip = 0;
+std::uint64_t g_drawopt_sync_full = 0;
+std::uint64_t g_drawopt_tex_skip = 0;
+std::uint64_t g_drawopt_tex_full = 0;
+std::uint64_t g_drawopt_bind_skip = 0;
+std::uint64_t g_drawopt_bind_full = 0;
+
+inline std::uint64_t NsSince(std::chrono::steady_clock::time_point t0) {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count());
+}
+
+// Compile-time bitmap of PICA register IDs that have a real (non-default) case
+// in PicaCore::WriteInternalReg's switch. The complement — everything NOT in
+// this set — falls into the default branch whose full effect is "merge value
+// into reg_array[id] + dirty_regs.Set(id)". For those, ProcessCmdList can
+// store-and-dirty inline without paying WriteInternalReg's 4-arg prologue,
+// the switch jump-table dispatch, or the pica-trace / debug-context checks.
+//
+// Trade-off: the inline fast path does NOT call OnPicaRegWrite (skips pica
+// tracing of default-case writes) and does NOT emit the
+// PicaCommandLoaded/Processed debug events. Both are debug-only features
+// that are off in gameplay; losing them on the hot default-case register
+// stream is the deliberate "dirty code for performance" trade we're making.
+//
+// The bitmap must stay in lockstep with the switch in WriteInternalReg —
+// drift means a real handler never runs (correctness bug). Keep the two
+// lists side-by-side visually when editing either.
+struct PicaHandlerBitmap {
+    std::array<std::uint64_t, (RegsInternal::NUM_REGS + 63) / 64> bits{};
+
+    constexpr void Mark(std::uint32_t id) {
+        bits[id / 64] |= (std::uint64_t{1} << (id % 64));
+    }
+    constexpr bool Contains(std::uint32_t id) const {
+        return (bits[id / 64] >> (id % 64)) & std::uint64_t{1};
+    }
+};
+
+constexpr PicaHandlerBitmap MakePicaHandlerBitmap() {
+    PicaHandlerBitmap b{};
+    b.Mark(PICA_REG_INDEX(irq_request));
+    b.Mark(PICA_REG_INDEX(pipeline.triangle_topology));
+    b.Mark(PICA_REG_INDEX(pipeline.restart_primitive));
+    b.Mark(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.index));
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        b.Mark(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[0]) + i);
+    }
+    b.Mark(PICA_REG_INDEX(pipeline.gpu_mode));
+    for (std::uint32_t i = 0; i < 2; ++i) {
+        b.Mark(PICA_REG_INDEX(pipeline.command_buffer.trigger[0]) + i);
+    }
+    b.Mark(PICA_REG_INDEX(pipeline.trigger_draw));
+    b.Mark(PICA_REG_INDEX(pipeline.trigger_draw_indexed));
+    b.Mark(PICA_REG_INDEX(gs.bool_uniforms));
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        b.Mark(PICA_REG_INDEX(gs.int_uniforms[0]) + i);
+    }
+    for (std::uint32_t i = 0; i < 8; ++i) {
+        b.Mark(PICA_REG_INDEX(gs.uniform_setup.set_value[0]) + i);
+        b.Mark(PICA_REG_INDEX(gs.program.set_word[0]) + i);
+        b.Mark(PICA_REG_INDEX(gs.swizzle_patterns.set_word[0]) + i);
+    }
+    b.Mark(PICA_REG_INDEX(vs.output_mask));
+    b.Mark(PICA_REG_INDEX(vs.bool_uniforms));
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        b.Mark(PICA_REG_INDEX(vs.int_uniforms[0]) + i);
+    }
+    for (std::uint32_t i = 0; i < 8; ++i) {
+        b.Mark(PICA_REG_INDEX(vs.uniform_setup.set_value[0]) + i);
+        b.Mark(PICA_REG_INDEX(vs.program.set_word[0]) + i);
+        b.Mark(PICA_REG_INDEX(vs.swizzle_patterns.set_word[0]) + i);
+        b.Mark(PICA_REG_INDEX(lighting.lut_data[0]) + i);
+        b.Mark(PICA_REG_INDEX(texturing.fog_lut_data[0]) + i);
+        b.Mark(PICA_REG_INDEX(texturing.proctex_lut_data[0]) + i);
+    }
+    return b;
+}
+
+constexpr PicaHandlerBitmap g_pica_handler_bitmap = MakePicaHandlerBitmap();
+
+inline bool PicaRegHasHandler(std::uint32_t id) {
+    return g_pica_handler_bitmap.Contains(id);
+}
+
+// True if `id` names a "pure-data" register whose WriteInternalReg handler only
+// stores a value into a side table and bumps an internal offset. For these, a
+// burst of N writes can be handled inline without re-dispatching the switch on
+// every item. Keep the switch list in lockstep with the cases in
+// PicaCore::WriteInternalReg and PicaCore::WriteBurstSameReg — drift between
+// the two lists would silently take the slow path (harmless correctness-wise,
+// just a missed optimization).
+inline bool IsPureDataBurstReg(u32 id) {
+    switch (id) {
+    case PICA_REG_INDEX(lighting.lut_data[0]):
+    case PICA_REG_INDEX(lighting.lut_data[1]):
+    case PICA_REG_INDEX(lighting.lut_data[2]):
+    case PICA_REG_INDEX(lighting.lut_data[3]):
+    case PICA_REG_INDEX(lighting.lut_data[4]):
+    case PICA_REG_INDEX(lighting.lut_data[5]):
+    case PICA_REG_INDEX(lighting.lut_data[6]):
+    case PICA_REG_INDEX(lighting.lut_data[7]):
+    case PICA_REG_INDEX(texturing.fog_lut_data[0]):
+    case PICA_REG_INDEX(texturing.fog_lut_data[1]):
+    case PICA_REG_INDEX(texturing.fog_lut_data[2]):
+    case PICA_REG_INDEX(texturing.fog_lut_data[3]):
+    case PICA_REG_INDEX(texturing.fog_lut_data[4]):
+    case PICA_REG_INDEX(texturing.fog_lut_data[5]):
+    case PICA_REG_INDEX(texturing.fog_lut_data[6]):
+    case PICA_REG_INDEX(texturing.fog_lut_data[7]):
+    case PICA_REG_INDEX(texturing.proctex_lut_data[0]):
+    case PICA_REG_INDEX(texturing.proctex_lut_data[1]):
+    case PICA_REG_INDEX(texturing.proctex_lut_data[2]):
+    case PICA_REG_INDEX(texturing.proctex_lut_data[3]):
+    case PICA_REG_INDEX(texturing.proctex_lut_data[4]):
+    case PICA_REG_INDEX(texturing.proctex_lut_data[5]):
+    case PICA_REG_INDEX(texturing.proctex_lut_data[6]):
+    case PICA_REG_INDEX(texturing.proctex_lut_data[7]):
+    case PICA_REG_INDEX(vs.uniform_setup.set_value[0]):
+    case PICA_REG_INDEX(vs.uniform_setup.set_value[1]):
+    case PICA_REG_INDEX(vs.uniform_setup.set_value[2]):
+    case PICA_REG_INDEX(vs.uniform_setup.set_value[3]):
+    case PICA_REG_INDEX(vs.uniform_setup.set_value[4]):
+    case PICA_REG_INDEX(vs.uniform_setup.set_value[5]):
+    case PICA_REG_INDEX(vs.uniform_setup.set_value[6]):
+    case PICA_REG_INDEX(vs.uniform_setup.set_value[7]):
+    case PICA_REG_INDEX(gs.uniform_setup.set_value[0]):
+    case PICA_REG_INDEX(gs.uniform_setup.set_value[1]):
+    case PICA_REG_INDEX(gs.uniform_setup.set_value[2]):
+    case PICA_REG_INDEX(gs.uniform_setup.set_value[3]):
+    case PICA_REG_INDEX(gs.uniform_setup.set_value[4]):
+    case PICA_REG_INDEX(gs.uniform_setup.set_value[5]):
+    case PICA_REG_INDEX(gs.uniform_setup.set_value[6]):
+    case PICA_REG_INDEX(gs.uniform_setup.set_value[7]):
+    case PICA_REG_INDEX(vs.program.set_word[0]):
+    case PICA_REG_INDEX(vs.program.set_word[1]):
+    case PICA_REG_INDEX(vs.program.set_word[2]):
+    case PICA_REG_INDEX(vs.program.set_word[3]):
+    case PICA_REG_INDEX(vs.program.set_word[4]):
+    case PICA_REG_INDEX(vs.program.set_word[5]):
+    case PICA_REG_INDEX(vs.program.set_word[6]):
+    case PICA_REG_INDEX(vs.program.set_word[7]):
+    case PICA_REG_INDEX(gs.program.set_word[0]):
+    case PICA_REG_INDEX(gs.program.set_word[1]):
+    case PICA_REG_INDEX(gs.program.set_word[2]):
+    case PICA_REG_INDEX(gs.program.set_word[3]):
+    case PICA_REG_INDEX(gs.program.set_word[4]):
+    case PICA_REG_INDEX(gs.program.set_word[5]):
+    case PICA_REG_INDEX(gs.program.set_word[6]):
+    case PICA_REG_INDEX(gs.program.set_word[7]):
+    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[0]):
+    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[1]):
+    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[2]):
+    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[3]):
+    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[4]):
+    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[5]):
+    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[6]):
+    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[7]):
+    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[0]):
+    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[1]):
+    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[2]):
+    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[3]):
+    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[4]):
+    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[5]):
+    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[6]):
+    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[7]):
+        return true;
+    default:
+        return false;
+    }
+}
+} // namespace
+
+PicaWriteProbeCounters GetAndResetPicaWriteProbe() {
+    PicaWriteProbeCounters out{g_pica_writes_total, g_pica_burst_items,
+                               g_pica_burst_invocations, g_pica_fast_single};
+    g_pica_writes_total = 0;
+    g_pica_burst_items = 0;
+    g_pica_burst_invocations = 0;
+    g_pica_fast_single = 0;
+    return out;
+}
+
+DrawProbeCounters GetAndResetDrawProbe() {
+    DrawProbeCounters out{g_draw_accel_n,        g_draw_accel_ns, g_draw_cpu_n,
+                          g_draw_cpu_ns,         g_draw_imm_n,    g_draw_imm_ns,
+                          g_draw_vertices_accel, g_draw_vertices_cpu};
+    g_draw_accel_n = 0;
+    g_draw_accel_ns = 0;
+    g_draw_cpu_n = 0;
+    g_draw_cpu_ns = 0;
+    g_draw_imm_n = 0;
+    g_draw_imm_ns = 0;
+    g_draw_vertices_accel = 0;
+    g_draw_vertices_cpu = 0;
+    return out;
+}
+
+DrawOptProbeCounters GetAndResetDrawOptProbe() {
+    DrawOptProbeCounters out{g_drawopt_sync_skip, g_drawopt_sync_full, g_drawopt_tex_skip,
+                             g_drawopt_tex_full,  g_drawopt_bind_skip, g_drawopt_bind_full};
+    g_drawopt_sync_skip = 0;
+    g_drawopt_sync_full = 0;
+    g_drawopt_tex_skip = 0;
+    g_drawopt_tex_full = 0;
+    g_drawopt_bind_skip = 0;
+    g_drawopt_bind_full = 0;
+    return out;
+}
+
+void IncDrawOptSyncStateSkip() { ++g_drawopt_sync_skip; }
+void IncDrawOptSyncStateFull() { ++g_drawopt_sync_full; }
+void IncDrawOptTexCacheSkip()  { ++g_drawopt_tex_skip; }
+void IncDrawOptTexCacheFull()  { ++g_drawopt_tex_full; }
+void IncDrawOptBindDescSkip()  { ++g_drawopt_bind_skip; }
+void IncDrawOptBindDescFull()  { ++g_drawopt_bind_full; }
 
 PicaCore::PicaCore(Memory::MemorySystem& memory_, std::shared_ptr<DebugContext> debug_context_)
     : memory{memory_}, debug_context{std::move(debug_context_)},
@@ -248,42 +344,14 @@ void PicaCore::SetInterruptHandler(Service::GSP::InterruptHandler& signal_interr
     this->signal_interrupt = signal_interrupt;
 }
 
-// Expand a 4-bit mask to 4-byte mask, e.g. 0b0101 -> 0x00FF00FF.
-// File-scope so both ProcessCmdList's inert fast path and WriteInternalReg's
-// slow path see the same table without duplicating it.
-static constexpr std::array<u32, 16> kExpandBitsToBytes = {
-    0x00000000, 0x000000ff, 0x0000ff00, 0x0000ffff, 0x00ff0000, 0x00ff00ff,
-    0x00ffff00, 0x00ffffff, 0xff000000, 0xff0000ff, 0xff00ff00, 0xff00ffff,
-    0xffff0000, 0xffff00ff, 0xffffff00, 0xffffffff,
-};
-
 void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) {
     if (ignore_list) {
         signal_interrupt(Service::GSP::InterruptId::P3D);
         return;
     }
-    const auto cmdlist_t0 = std::chrono::steady_clock::now();
-    std::uint64_t regwrites_in_this_list = 0;
-
     // Initialize command list tracking.
     const u8* head = memory.GetPhysicalPointer(list);
     cmd_list.Reset(list, head, size);
-
-    // Hot inner loop: per-register-write dispatch is written inline here
-    // (rather than as a function call to WriteInternalReg) so the compiler
-    // can keep reg_array base and dirty_regs state in registers across
-    // iterations. The inert path — ~95% of writes on SMB3DL — does the
-    // read-modify-write on reg_array[id] + dirty-bit set directly. Only the
-    // ~5% of writes that hit action-triggering register IDs pay the cost of
-    // the full WriteInternalRegAction call (which contains the switch for
-    // the side-effect cases — we don't duplicate that logic).
-    //
-    // Register IDs are classified at program startup via GetActionBitset()
-    // which is built from exactly the list of `case PICA_REG_INDEX(...)`
-    // labels in WriteInternalRegAction.
-    auto* const reg_array = regs.internal.reg_array.data();
-    auto& pica_dirty = dirty_regs;
-    const bool tracing = DebugUtils::IsPicaTracing();
 
     bool stop_requested = false;
     while (cmd_list.current_index < cmd_list.length) {
@@ -299,69 +367,87 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) {
         const u32 value = cmd_list.head[cmd_list.current_index++];
         const CommandHeader header{cmd_list.head[cmd_list.current_index++]};
 
-        // Inert fast path inline; action path dispatches to WriteInternalReg.
-        const u32 id = header.cmd_id;
-        if (id < RegsInternal::NUM_REGS) [[likely]] {
-            const u32 write_mask = kExpandBitsToBytes[header.parameter_mask];
-            reg_array[id] = (reg_array[id] & ~write_mask) | (value & write_mask);
-            pica_dirty.Set(id);
-            if (tracing) [[unlikely]] {
-                DebugUtils::OnPicaRegWrite(static_cast<u16>(id),
-                                           static_cast<u16>(header.parameter_mask),
-                                           reg_array[id]);
-            }
-            if (debug_context) [[unlikely]] {
-                debug_context->OnEvent(DebugContext::Event::PicaCommandLoaded, &id);
-            }
-            if (IsActionRegister(id)) [[unlikely]] {
-                WriteInternalRegAction(id, value, header.parameter_mask, stop_requested);
-            }
-            if (debug_context) [[unlikely]] {
-                debug_context->OnEvent(DebugContext::Event::PicaCommandProcessed, &id);
-            }
+        // Leading write. Fast path: if cmd_id has no real handler in
+        // WriteInternalReg's switch, inline "merge + store + dirty". Saves the
+        // function-call prologue, the switch dispatch, and the debug hooks.
+        // Intentionally duplicated at the extras site below — the hot path
+        // stays a flat straight line with no indirection.
+        if (header.cmd_id < RegsInternal::NUM_REGS &&
+            !PicaRegHasHandler(header.cmd_id)) [[likely]] {
+            const u32 write_mask = ExpandBitsToBytes[header.parameter_mask];
+            u32& slot = regs.internal.reg_array[header.cmd_id];
+            slot = (slot & ~write_mask) | (value & write_mask);
+            dirty_regs.Set(header.cmd_id);
+            ++g_pica_fast_single;
         } else {
-            LOG_ERROR(HW_GPU,
-                      "Commandlist tried to write to invalid register 0x{:03X}",
-                      id);
+            WriteInternalReg(header.cmd_id, value, header.parameter_mask, stop_requested);
+            ++g_pica_writes_total;
         }
-        ++regwrites_in_this_list;
 
-        // Write any extra paramters as well.
-        for (u32 i = 0; i < header.extra_data_length; ++i) {
+        const u32 extra = header.extra_data_length;
+        if (extra == 0) {
+            continue;
+        }
+
+        // Burst fast path: when all extras target the same register (the GSP
+        // command stream's run-length encoding used for LUT / uniform / program
+        // / swizzle uploads), and that register is a pure-data sink, hand the
+        // whole run to WriteBurstSameReg so it pays the switch-dispatch cost
+        // once instead of `extra` times.
+        if (!header.group_commands.Value() && IsPureDataBurstReg(header.cmd_id) &&
+            !stop_requested) {
+            const u32* values = &cmd_list.head[cmd_list.current_index];
+            cmd_list.current_index += extra;
+            WriteBurstSameReg(header.cmd_id, values, extra, header.parameter_mask,
+                              stop_requested);
+            g_pica_burst_items += extra;
+            ++g_pica_burst_invocations;
+            continue;
+        }
+
+        // Secondary burst case: a same-target burst (!group_commands) to a
+        // register that isn't in the pure-data allowlist. These still pay the
+        // real-handler cost per item, but they all have the same (no-op) mask
+        // expansion and bounds classification. If the target has no handler,
+        // we can service the whole run inline right here — saves one
+        // HasHandler lookup + one WriteInternalReg call per item in a tight
+        // loop. For "dirty code" speedup, fine — `cmd` is constant for the run.
+        if (!header.group_commands.Value() && !stop_requested &&
+            header.cmd_id < RegsInternal::NUM_REGS &&
+            !PicaRegHasHandler(header.cmd_id)) {
+            const u32 write_mask = ExpandBitsToBytes[header.parameter_mask];
+            u32& slot = regs.internal.reg_array[header.cmd_id];
+            for (u32 i = 0; i < extra; ++i) {
+                const u32 v = cmd_list.head[cmd_list.current_index++];
+                slot = (slot & ~write_mask) | (v & write_mask);
+            }
+            dirty_regs.Set(header.cmd_id);
+            g_pica_fast_single += extra;
+            continue;
+        }
+
+        // Generic path (group_commands, or a same-target handler register
+        // that's neither pure-data nor a no-op default-case).
+        for (u32 i = 0; i < extra; ++i) {
             if (stop_requested) [[unlikely]] {
                 break;
             }
-            const u32 extra_id = header.cmd_id + (header.group_commands ? i + 1 : 0);
+            const u32 cmd = header.cmd_id + (header.group_commands ? i + 1 : 0);
             const u32 extra_value = cmd_list.head[cmd_list.current_index++];
-            if (extra_id < RegsInternal::NUM_REGS) [[likely]] {
-                const u32 write_mask = kExpandBitsToBytes[header.parameter_mask];
-                reg_array[extra_id] =
-                    (reg_array[extra_id] & ~write_mask) | (extra_value & write_mask);
-                pica_dirty.Set(extra_id);
-                if (tracing) [[unlikely]] {
-                    DebugUtils::OnPicaRegWrite(static_cast<u16>(extra_id),
-                                               static_cast<u16>(header.parameter_mask),
-                                               reg_array[extra_id]);
-                }
-                if (debug_context) [[unlikely]] {
-                    debug_context->OnEvent(DebugContext::Event::PicaCommandLoaded, &extra_id);
-                }
-                if (IsActionRegister(extra_id)) [[unlikely]] {
-                    WriteInternalRegAction(extra_id, extra_value, header.parameter_mask,
-                                           stop_requested);
-                }
-                if (debug_context) [[unlikely]] {
-                    debug_context->OnEvent(DebugContext::Event::PicaCommandProcessed,
-                                           &extra_id);
-                }
+            // Per-item fast path — same logic as the leading write above,
+            // duplicated for zero-indirection hot loop.
+            if (cmd < RegsInternal::NUM_REGS && !PicaRegHasHandler(cmd)) [[likely]] {
+                const u32 write_mask = ExpandBitsToBytes[header.parameter_mask];
+                u32& slot = regs.internal.reg_array[cmd];
+                slot = (slot & ~write_mask) | (extra_value & write_mask);
+                dirty_regs.Set(cmd);
+                ++g_pica_fast_single;
+            } else {
+                WriteInternalReg(cmd, extra_value, header.parameter_mask, stop_requested);
+                ++g_pica_writes_total;
             }
-            ++regwrites_in_this_list;
         }
     }
-
-    g_cmdlist_probe.cmdlists_n += 1;
-    g_cmdlist_probe.cmdlists_ns += NanosSince(cmdlist_t0);
-    g_cmdlist_probe.regwrites_n += regwrites_in_this_list;
 }
 
 static bool any_byte_match(u32 a, u32 b) {
@@ -369,12 +455,28 @@ static bool any_byte_match(u32 a, u32 b) {
            (((a >> 16) & 0xFF) == ((b >> 16) & 0xFF)) || (((a >> 24) & 0xFF) == ((b >> 24) & 0xFF));
 }
 
-void PicaCore::WriteInternalRegAction(u32 id, u32 value, u32 mask, bool& stop_requested) {
-    // NOTE: the read-modify-write on regs.internal.reg_array[id], the dirty-
-    // bit set, and the debug tracing hooks have ALREADY been performed by
-    // ProcessCmdList's hot loop before this function is called. This function
-    // is only invoked for the ~5% of register IDs that have an associated
-    // side effect in the switch below. Do NOT re-run the RMW here.
+void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requested) {
+    if (id >= RegsInternal::NUM_REGS) {
+        LOG_ERROR(
+            HW_GPU,
+            "Commandlist tried to write to invalid register 0x{:03X} (value: {:08X}, mask: {:X})",
+            id, value, mask);
+        return;
+    }
+
+    // TODO: Figure out how register masking acts on e.g. vs.uniform_setup.set_value
+    const u32 old_value = regs.internal.reg_array[id];
+    const u32 write_mask = ExpandBitsToBytes[mask];
+    regs.internal.reg_array[id] = (old_value & ~write_mask) | (value & write_mask);
+
+    // Track register write.
+    DebugUtils::OnPicaRegWrite(id, mask, regs.internal.reg_array[id]);
+
+    // Track events.
+    if (debug_context) {
+        debug_context->OnEvent(DebugContext::Event::PicaCommandLoaded, &id);
+    }
+
     switch (id) {
     // Trigger IRQ
     case PICA_REG_INDEX(irq_request):
@@ -425,10 +527,7 @@ void PicaCore::WriteInternalRegAction(u32 id, u32 value, u32 mask, bool& stop_re
     case PICA_REG_INDEX(pipeline.trigger_draw):
     case PICA_REG_INDEX(pipeline.trigger_draw_indexed): {
         const bool is_indexed = (id == PICA_REG_INDEX(pipeline.trigger_draw_indexed));
-        const auto draw_t0 = std::chrono::steady_clock::now();
         DrawArrays(is_indexed);
-        g_cmdlist_probe.draws_n += 1;
-        g_cmdlist_probe.draws_ns += NanosSince(draw_t0);
         break;
     }
 
@@ -650,11 +749,270 @@ void PicaCore::WriteInternalRegAction(u32 id, u32 value, u32 mask, bool& stop_re
         break;
     }
     default:
-        // Unreachable in correct operation: IsActionRegister() must only
-        // return true for IDs that also appear as a case label above.
-        // Fall through if mismatch to avoid UB.
         break;
     }
+
+    dirty_regs.Set(id);
+
+    if (debug_context) {
+        debug_context->OnEvent(DebugContext::Event::PicaCommandProcessed, &id);
+    }
+}
+
+void PicaCore::WriteBurstSameReg(u32 id, const u32* values, u32 count, u32 mask,
+                                 bool& stop_requested) {
+    // Fast path for bursts (header.extra_data_length > 0, !group_commands) that
+    // target a pure-data register. We lift the per-item switch dispatch, the
+    // bounds check, the ExpandBitsToBytes lookup, and the dirty_regs.Set bit
+    // flip out of the loop. Per-item cost drops from "full WriteInternalReg
+    // prologue + switch + debug hooks" to "load + store + offset bump".
+    //
+    // If `id` isn't on the pure-data allowlist, fall back to per-call
+    // WriteInternalReg — the burst path and the switch in WriteInternalReg
+    // must agree; drift silently degrades perf, not correctness.
+    if (id >= RegsInternal::NUM_REGS) [[unlikely]] {
+        LOG_ERROR(HW_GPU, "Burst write to invalid register 0x{:03X} count={}", id, count);
+        return;
+    }
+    if (!IsPureDataBurstReg(id)) {
+        for (u32 i = 0; i < count; ++i) {
+            if (stop_requested) [[unlikely]] {
+                return;
+            }
+            WriteInternalReg(id, values[i], mask, stop_requested);
+        }
+        return;
+    }
+
+    const u32 write_mask = ExpandBitsToBytes[mask];
+    u32& reg_slot = regs.internal.reg_array[id];
+
+    // Skip per-item OnPicaRegWrite: tracing is a debug-only feature guarded by
+    // a global [[likely]]-off branch; losing coverage during a trace of a burst
+    // is acceptable. Same for debug_context events — those fire from the
+    // tool-attached debugger path, not gameplay.
+    switch (id) {
+    case PICA_REG_INDEX(lighting.lut_data[0]):
+    case PICA_REG_INDEX(lighting.lut_data[1]):
+    case PICA_REG_INDEX(lighting.lut_data[2]):
+    case PICA_REG_INDEX(lighting.lut_data[3]):
+    case PICA_REG_INDEX(lighting.lut_data[4]):
+    case PICA_REG_INDEX(lighting.lut_data[5]):
+    case PICA_REG_INDEX(lighting.lut_data[6]):
+    case PICA_REG_INDEX(lighting.lut_data[7]): {
+        auto& lut_config = regs.internal.lighting.lut_config;
+        const u32 type = lut_config.type;
+        for (u32 i = 0; i < count; ++i) {
+            const u32 v = values[i];
+            reg_slot = (reg_slot & ~write_mask) | (v & write_mask);
+            ASSERT_MSG(lut_config.index < 256, "lut_config.index exceeded 255");
+            const u32 prev = std::exchange(lighting.luts[type][lut_config.index].raw, v);
+            lighting.lut_dirty |= (prev != v) << type;
+            lut_config.index.Assign(lut_config.index + 1);
+        }
+        break;
+    }
+    case PICA_REG_INDEX(texturing.fog_lut_data[0]):
+    case PICA_REG_INDEX(texturing.fog_lut_data[1]):
+    case PICA_REG_INDEX(texturing.fog_lut_data[2]):
+    case PICA_REG_INDEX(texturing.fog_lut_data[3]):
+    case PICA_REG_INDEX(texturing.fog_lut_data[4]):
+    case PICA_REG_INDEX(texturing.fog_lut_data[5]):
+    case PICA_REG_INDEX(texturing.fog_lut_data[6]):
+    case PICA_REG_INDEX(texturing.fog_lut_data[7]): {
+        auto& fog_offset = regs.internal.texturing.fog_lut_offset;
+        for (u32 i = 0; i < count; ++i) {
+            const u32 v = values[i];
+            reg_slot = (reg_slot & ~write_mask) | (v & write_mask);
+            const u32 prev = std::exchange(fog.lut[fog_offset % 128].raw, v);
+            fog.lut_dirty |= prev != v;
+            fog_offset.Assign(fog_offset + 1);
+        }
+        break;
+    }
+    case PICA_REG_INDEX(texturing.proctex_lut_data[0]):
+    case PICA_REG_INDEX(texturing.proctex_lut_data[1]):
+    case PICA_REG_INDEX(texturing.proctex_lut_data[2]):
+    case PICA_REG_INDEX(texturing.proctex_lut_data[3]):
+    case PICA_REG_INDEX(texturing.proctex_lut_data[4]):
+    case PICA_REG_INDEX(texturing.proctex_lut_data[5]):
+    case PICA_REG_INDEX(texturing.proctex_lut_data[6]):
+    case PICA_REG_INDEX(texturing.proctex_lut_data[7]): {
+        auto& index = regs.internal.texturing.proctex_lut_config.index;
+        const auto lut_table = regs.internal.texturing.proctex_lut_config.ref_table.Value();
+        const u32 table_bit = 1u << u32(lut_table);
+        auto update = [&](auto& tbl) {
+            for (u32 i = 0; i < count; ++i) {
+                const u32 v = values[i];
+                reg_slot = (reg_slot & ~write_mask) | (v & write_mask);
+                const u32 prev = std::exchange(tbl[index % tbl.size()].raw, v);
+                proctex.table_dirty |= (prev != v) ? table_bit : 0;
+                index.Assign(index + 1);
+            }
+        };
+        switch (lut_table) {
+        case TexturingRegs::ProcTexLutTable::Noise:
+            update(proctex.noise_table);
+            break;
+        case TexturingRegs::ProcTexLutTable::ColorMap:
+            update(proctex.color_map_table);
+            break;
+        case TexturingRegs::ProcTexLutTable::AlphaMap:
+            update(proctex.alpha_map_table);
+            break;
+        case TexturingRegs::ProcTexLutTable::Color:
+            update(proctex.color_table);
+            break;
+        case TexturingRegs::ProcTexLutTable::ColorDiff:
+            update(proctex.color_diff_table);
+            break;
+        }
+        break;
+    }
+    case PICA_REG_INDEX(vs.uniform_setup.set_value[0]):
+    case PICA_REG_INDEX(vs.uniform_setup.set_value[1]):
+    case PICA_REG_INDEX(vs.uniform_setup.set_value[2]):
+    case PICA_REG_INDEX(vs.uniform_setup.set_value[3]):
+    case PICA_REG_INDEX(vs.uniform_setup.set_value[4]):
+    case PICA_REG_INDEX(vs.uniform_setup.set_value[5]):
+    case PICA_REG_INDEX(vs.uniform_setup.set_value[6]):
+    case PICA_REG_INDEX(vs.uniform_setup.set_value[7]): {
+        const bool mirror_to_gs = !regs.internal.pipeline.gs_unit_exclusive_configuration &&
+                                  regs.internal.pipeline.use_gs == PipelineRegs::UseGS::No;
+        for (u32 i = 0; i < count; ++i) {
+            const u32 v = values[i];
+            reg_slot = (reg_slot & ~write_mask) | (v & write_mask);
+            const auto index = vs_setup.WriteUniformFloatReg(regs.internal.vs, v);
+            if (mirror_to_gs && index) {
+                gs_setup.uniforms.f[index.value()] = vs_setup.uniforms.f[index.value()];
+            }
+        }
+        break;
+    }
+    case PICA_REG_INDEX(gs.uniform_setup.set_value[0]):
+    case PICA_REG_INDEX(gs.uniform_setup.set_value[1]):
+    case PICA_REG_INDEX(gs.uniform_setup.set_value[2]):
+    case PICA_REG_INDEX(gs.uniform_setup.set_value[3]):
+    case PICA_REG_INDEX(gs.uniform_setup.set_value[4]):
+    case PICA_REG_INDEX(gs.uniform_setup.set_value[5]):
+    case PICA_REG_INDEX(gs.uniform_setup.set_value[6]):
+    case PICA_REG_INDEX(gs.uniform_setup.set_value[7]): {
+        for (u32 i = 0; i < count; ++i) {
+            const u32 v = values[i];
+            reg_slot = (reg_slot & ~write_mask) | (v & write_mask);
+            gs_setup.WriteUniformFloatReg(regs.internal.gs, v);
+        }
+        break;
+    }
+    case PICA_REG_INDEX(vs.program.set_word[0]):
+    case PICA_REG_INDEX(vs.program.set_word[1]):
+    case PICA_REG_INDEX(vs.program.set_word[2]):
+    case PICA_REG_INDEX(vs.program.set_word[3]):
+    case PICA_REG_INDEX(vs.program.set_word[4]):
+    case PICA_REG_INDEX(vs.program.set_word[5]):
+    case PICA_REG_INDEX(vs.program.set_word[6]):
+    case PICA_REG_INDEX(vs.program.set_word[7]): {
+        const bool mirror_to_gs = !regs.internal.pipeline.gs_unit_exclusive_configuration &&
+                                  regs.internal.pipeline.use_gs == PipelineRegs::UseGS::No;
+        u32& offset = regs.internal.vs.program.offset;
+        for (u32 i = 0; i < count; ++i) {
+            const u32 v = values[i];
+            reg_slot = (reg_slot & ~write_mask) | (v & write_mask);
+            if (offset >= 512) [[unlikely]] {
+                LOG_ERROR(HW_GPU, "Invalid VS program offset {}", offset);
+                continue;
+            }
+            vs_setup.UpdateProgramCode(offset, v);
+            if (mirror_to_gs) {
+                gs_setup.UpdateProgramCode(offset, v);
+            }
+            offset++;
+        }
+        break;
+    }
+    case PICA_REG_INDEX(gs.program.set_word[0]):
+    case PICA_REG_INDEX(gs.program.set_word[1]):
+    case PICA_REG_INDEX(gs.program.set_word[2]):
+    case PICA_REG_INDEX(gs.program.set_word[3]):
+    case PICA_REG_INDEX(gs.program.set_word[4]):
+    case PICA_REG_INDEX(gs.program.set_word[5]):
+    case PICA_REG_INDEX(gs.program.set_word[6]):
+    case PICA_REG_INDEX(gs.program.set_word[7]): {
+        u32& offset = regs.internal.gs.program.offset;
+        for (u32 i = 0; i < count; ++i) {
+            const u32 v = values[i];
+            reg_slot = (reg_slot & ~write_mask) | (v & write_mask);
+            if (offset >= 4096) [[unlikely]] {
+                LOG_ERROR(HW_GPU, "Invalid GS program offset {}", offset);
+                continue;
+            }
+            gs_setup.UpdateProgramCode(offset, v);
+            offset++;
+        }
+        break;
+    }
+    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[0]):
+    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[1]):
+    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[2]):
+    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[3]):
+    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[4]):
+    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[5]):
+    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[6]):
+    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[7]): {
+        const bool mirror_to_gs = !regs.internal.pipeline.gs_unit_exclusive_configuration &&
+                                  regs.internal.pipeline.use_gs == PipelineRegs::UseGS::No;
+        u32& offset = regs.internal.vs.swizzle_patterns.offset;
+        const auto swizzle_size = vs_setup.GetSwizzleData().size();
+        for (u32 i = 0; i < count; ++i) {
+            const u32 v = values[i];
+            reg_slot = (reg_slot & ~write_mask) | (v & write_mask);
+            if (offset >= swizzle_size) [[unlikely]] {
+                LOG_ERROR(HW_GPU, "Invalid VS swizzle pattern offset {}", offset);
+                continue;
+            }
+            vs_setup.UpdateSwizzleData(offset, v);
+            if (mirror_to_gs) {
+                gs_setup.UpdateSwizzleData(offset, v);
+            }
+            offset++;
+        }
+        break;
+    }
+    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[0]):
+    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[1]):
+    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[2]):
+    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[3]):
+    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[4]):
+    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[5]):
+    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[6]):
+    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[7]): {
+        u32& offset = regs.internal.gs.swizzle_patterns.offset;
+        const auto swizzle_size = gs_setup.GetSwizzleData().size();
+        for (u32 i = 0; i < count; ++i) {
+            const u32 v = values[i];
+            reg_slot = (reg_slot & ~write_mask) | (v & write_mask);
+            if (offset >= swizzle_size) [[unlikely]] {
+                LOG_ERROR(HW_GPU, "Invalid GS swizzle pattern offset {}", offset);
+                continue;
+            }
+            gs_setup.UpdateSwizzleData(offset, v);
+            offset++;
+        }
+        break;
+    }
+    default:
+        // IsPureDataBurstReg said yes but no case matched — keep the switches
+        // in sync. Fall back to per-call to preserve correctness.
+        for (u32 i = 0; i < count; ++i) {
+            WriteInternalReg(id, values[i], mask, stop_requested);
+            if (stop_requested) [[unlikely]] {
+                return;
+            }
+        }
+        return;
+    }
+
+    dirty_regs.Set(id);
 }
 
 void PicaCore::SubmitImmediate(u32 value) {
@@ -691,6 +1049,8 @@ void PicaCore::SubmitImmediate(u32 value) {
 }
 
 void PicaCore::DrawImmediate() {
+    const auto imm_t0 = std::chrono::steady_clock::now();
+
     // Compile the vertex shader.
     shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
 
@@ -726,13 +1086,21 @@ void PicaCore::DrawImmediate() {
     if (debug_context) {
         debug_context->OnEvent(DebugContext::Event::FinishedPrimitiveBatch, nullptr);
     }
+
+    ++g_draw_imm_n;
+    g_draw_imm_ns += NsSince(imm_t0);
 }
 
 void PicaCore::DrawArrays(bool is_indexed) {
     MICROPROFILE_SCOPE(GPU_Drawing);
 
+    // DrawProbe: time each draw so we can attribute the GpuExecProbe cmdlist
+    // bucket to reg-writes vs actual draw submission.
+    const auto draw_t0 = std::chrono::steady_clock::now();
+    const u32 vertex_count = regs.internal.pipeline.num_vertices;
+
     // Track vertex in the debug recorder.
-    if (debug_context) [[unlikely]] {
+    if (debug_context) {
         debug_context->OnEvent(DebugContext::Event::IncomingPrimitiveBatch, nullptr);
     }
 
@@ -760,6 +1128,9 @@ void PicaCore::DrawArrays(bool is_indexed) {
 
     // Attempt to use hardware vertex shaders if possible.
     if (accelerate_draw && rasterizer->AccelerateDrawBatch(is_indexed)) {
+        ++g_draw_accel_n;
+        g_draw_accel_ns += NsSince(draw_t0);
+        g_draw_vertices_accel += vertex_count;
         return;
     }
 
@@ -769,9 +1140,13 @@ void PicaCore::DrawArrays(bool is_indexed) {
     // Draw emitted triangles.
     rasterizer->DrawTriangles();
 
-    if (debug_context) [[unlikely]] {
+    if (debug_context) {
         debug_context->OnEvent(DebugContext::Event::FinishedPrimitiveBatch, nullptr);
     }
+
+    ++g_draw_cpu_n;
+    g_draw_cpu_ns += NsSince(draw_t0);
+    g_draw_vertices_cpu += vertex_count;
 }
 
 void PicaCore::LoadVertices(bool is_indexed) {

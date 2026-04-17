@@ -673,6 +673,70 @@ void GPU::VBlankOnWorker(s64 cycles_late) {
                  g_worker_exec_other.exchange(0),
                  g_worker_setbufferswap.exchange(0),
                  mmio_count);
+        LOG_INFO(HW_GPU,
+                 "GpuExecProbe cmdlist[n={} ms={:.2f}] dma[n={} ms={:.2f}] "
+                 "other[n={} ms={:.2f}]",
+                 g_gpu_exec.cmdlist_n, g_gpu_exec.cmdlist_ns / 1.0e6,
+                 g_gpu_exec.dma_n, g_gpu_exec.dma_ns / 1.0e6,
+                 g_gpu_exec.other_n, g_gpu_exec.other_ns / 1.0e6);
+        // Per-cmdlist PICA register-write breakdown. `writes` is the number of
+        // WriteInternalReg invocations taking the slow (switch-dispatch) path;
+        // `burst_items` is items handled by the fast WriteBurstSameReg path,
+        // spread across `burst_invocations` runs (≈ items/invocation per run).
+        const auto pica_writes = Pica::GetAndResetPicaWriteProbe();
+        LOG_INFO(HW_GPU,
+                 "PicaWriteProbe slow={} fast_single={} burst_items={} "
+                 "burst_invocations={} avg_burst_len={:.1f}",
+                 pica_writes.writes_total, pica_writes.fast_single,
+                 pica_writes.burst_items, pica_writes.burst_invocations,
+                 pica_writes.burst_invocations
+                     ? static_cast<double>(pica_writes.burst_items) /
+                           static_cast<double>(pica_writes.burst_invocations)
+                     : 0.0);
+        // DrawProbe: per-second draw-call attribution. `accel` = HW vertex
+        // shader path (rasterizer->AccelerateDrawBatch accepted). `cpu` =
+        // fallback — PICA vertex shader executed on the emu thread per
+        // vertex, then rasterizer->DrawTriangles(). `imm` = immediate-mode
+        // (rare). Sum(ms) is a lower bound on time spent in cmdlist's
+        // trigger_draw handler; subtract from GpuExecProbe cmdlist_ms to
+        // estimate reg-write vs draw-submit cost.
+        const auto draw = Pica::GetAndResetDrawProbe();
+        LOG_INFO(HW_GPU,
+                 "DrawProbe accel[n={} ms={:.2f} vtx={}] cpu[n={} ms={:.2f} vtx={}] "
+                 "imm[n={} ms={:.2f}]",
+                 draw.accel_n, draw.accel_ns / 1.0e6, draw.vertices_accel,
+                 draw.cpu_n, draw.cpu_ns / 1.0e6, draw.vertices_cpu,
+                 draw.imm_n, draw.imm_ns / 1.0e6);
+        // DrawOptProbe: per-second hit/miss counts for the three draw-path
+        // optimizations. `sync`=SyncDrawState gate (A), `tex`=SyncTextureUnits
+        // cache (B), `bind`=skip cmdbuf.bindDescriptorSets (C). Dividing
+        // skip/(skip+full) gives the hit rate — for 140 draws/frame, above 70%
+        // is the target since most consecutive SMB3DL draws share state.
+        const auto drawopt = Pica::GetAndResetDrawOptProbe();
+        const auto hit_rate = [](u64 s, u64 f) {
+            return (s + f) ? 100.0 * static_cast<double>(s) / static_cast<double>(s + f) : 0.0;
+        };
+        LOG_INFO(HW_GPU,
+                 "DrawOptProbe sync[skip={} full={} hit={:.1f}%] tex[skip={} full={} hit={:.1f}%] "
+                 "bind[skip={} full={} hit={:.1f}%]",
+                 drawopt.sync_state_skip, drawopt.sync_state_full,
+                 hit_rate(drawopt.sync_state_skip, drawopt.sync_state_full),
+                 drawopt.tex_cache_skip, drawopt.tex_cache_full,
+                 hit_rate(drawopt.tex_cache_skip, drawopt.tex_cache_full),
+                 drawopt.bind_desc_skip, drawopt.bind_desc_full,
+                 hit_rate(drawopt.bind_desc_skip, drawopt.bind_desc_full));
+        LOG_INFO(HW_GPU,
+                 "TexXferProbe tc[accel={} ({:.2f}ms) sw={} ({:.2f}ms)] "
+                 "dt[accel={} ({:.2f}ms) sw={} ({:.2f}ms)] "
+                 "mf[accel={} ({:.2f}ms) sw={} ({:.2f}ms)]",
+                 g_tex_xfer.accel_tc, g_tex_xfer.accel_tc_ns / 1.0e6,
+                 g_tex_xfer.sw_tc, g_tex_xfer.sw_tc_ns / 1.0e6,
+                 g_tex_xfer.accel_dt, g_tex_xfer.accel_dt_ns / 1.0e6,
+                 g_tex_xfer.sw_dt, g_tex_xfer.sw_dt_ns / 1.0e6,
+                 g_tex_xfer.accel_mf, g_tex_xfer.accel_mf_ns / 1.0e6,
+                 g_tex_xfer.sw_mf, g_tex_xfer.sw_mf_ns / 1.0e6);
+        g_gpu_exec = GpuExecCounters{};
+        g_tex_xfer = TexXferCounters{};
     }
 }
 

@@ -166,7 +166,20 @@ void RasterizerVulkan::LoadDefaultDiskResources(
 }
 
 void RasterizerVulkan::SyncDrawState() {
+    // Snapshot the subset of dirty_regs that drives this function BEFORE
+    // SyncDrawUniforms (which clears all dirty bits at its end). On subsequent
+    // draws with the same pipeline_info — the common case in SMB3DL — we can
+    // skip the 30-line register-read ladder below.
+    const bool draw_state_dirty = pica.dirty_regs.CheckDrawState();
+
     SyncDrawUniforms();
+
+    if (draw_state_valid && !draw_state_dirty) {
+        Pica::IncDrawOptSyncStateSkip();
+        return;
+    }
+    Pica::IncDrawOptSyncStateFull();
+    draw_state_valid = true;
 
     // SyncCullMode();
     pipeline_info.state.rasterization.cull_mode.Assign(regs.rasterizer.cull_mode);
@@ -670,11 +683,73 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
     using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
 
     const auto pica_textures = regs.texturing.GetTextures();
-    const bool use_cube_heap =
-        pica_textures[0].enabled && pica_textures[0].config.type == TextureType::ShadowCube;
-    const auto texture_set = pipeline_cache.Acquire(use_cube_heap ? DescriptorHeapType::Texture
-                                                                  : DescriptorHeapType::Texture);
 
+    // Fast path is disabled when unit 0 uses a non-standard texture type —
+    // Shadow2D writes a StorageView, ShadowCube / TextureCube call helpers
+    // that issue their own Acquire + multi-face descriptor writes. Those
+    // paths are too structurally different for the simple (view, sampler)
+    // cache below; fall through to the original uncached logic for them.
+    const bool unit0_special = pica_textures[0].enabled &&
+                               (pica_textures[0].config.type == TextureType::Shadow2D ||
+                                pica_textures[0].config.type == TextureType::ShadowCube ||
+                                pica_textures[0].config.type == TextureType::TextureCube);
+
+    if (!unit0_special) {
+        // Resolve the (view, sampler) that would be bound to each of the 3
+        // units up-front. GetTextureSurface / GetSampler are hash-keyed
+        // lookups into res_cache — cheap after warmup, and necessary anyway
+        // to build the comparison key. The comparison catches the common
+        // case of 140 consecutive SMB3DL draws all sharing texture state.
+        std::array<vk::ImageView, 3> views{};
+        std::array<vk::Sampler, 3> samplers{};
+        const vk::ImageView color_view = framebuffer->ImageView(SurfaceType::Color);
+        for (u32 i = 0; i < 3; ++i) {
+            const auto& texture = pica_textures[i];
+            if (!texture.enabled) {
+                Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_ID);
+                const Sampler& null_sampler = res_cache.GetSampler(VideoCore::NULL_SAMPLER_ID);
+                views[i] = null_surface.ImageView();
+                samplers[i] = null_sampler.Handle();
+                continue;
+            }
+            Surface& surface = res_cache.GetTextureSurface(texture);
+            Sampler& sampler = res_cache.GetSampler(texture.config);
+            const bool is_feedback_loop = color_view == surface.FramebufferView();
+            views[i] = is_feedback_loop ? surface.CopyImageView() : surface.ImageView();
+            samplers[i] = sampler.Handle();
+        }
+
+        // Cache-hit window: same scheduler tick AND identical resolved
+        // handles. Within a tick, the previously-committed Texture descriptor
+        // set's slot is still pinned (resource pool won't recycle it), so
+        // reusing its handle in bound_descriptor_sets[Texture] is safe. When
+        // the tick advances (next scheduler submission) we force a re-Acquire
+        // so the new submission gets its own pinned slot.
+        const u64 current_tick = scheduler.CurrentTick();
+        if (tex_cache_tick == current_tick && views == cached_tex_views &&
+            samplers == cached_tex_samplers) {
+            Pica::IncDrawOptTexCacheSkip();
+            return;
+        }
+
+        const auto texture_set = pipeline_cache.Acquire(DescriptorHeapType::Texture);
+        for (u32 i = 0; i < 3; ++i) {
+            update_queue.AddImageSampler(texture_set, i, 0, views[i], samplers[i]);
+        }
+        cached_tex_views = views;
+        cached_tex_samplers = samplers;
+        tex_cache_tick = current_tick;
+        Pica::IncDrawOptTexCacheFull();
+        return;
+    }
+
+    // Uncached path: the special-case configurations (shadow / cube) write to
+    // multiple descriptor slots via internal helpers; invalidate our cache so
+    // the next simple-path draw does a fresh Acquire rather than reusing a
+    // set we didn't touch.
+    tex_cache_tick = 0;
+
+    const auto texture_set = pipeline_cache.Acquire(DescriptorHeapType::Texture);
     for (u32 texture_index = 0; texture_index < pica_textures.size(); ++texture_index) {
         const auto& texture = pica_textures[texture_index];
 
