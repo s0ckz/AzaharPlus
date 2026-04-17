@@ -182,6 +182,17 @@ private:
     void DrainAllDeferredSwTc();
     // Worker: perform one drain entry (wait, memcpy, invalidate).
     void PerformDeferredSwTc(DeferredSwTc& entry);
+
+    // Fix A: GPU-to-GPU shifted-tile byte copy. When the source is a cached
+    // tiled VkImage that fully contains the byte range, we can do
+    // vkCmdCopyImage from source to a newly-created destination VkImage with
+    // the same tile layout — no CPU round-trip, no fence Wait. Returns true
+    // if handled; caller should try the async CPU memcpy path as a fallback.
+    bool TryGpuToGpuShiftedCopy(const Pica::DisplayTransferConfig& config);
+
+    // Fix B: async CPU readback + deferred memcpy. Pulled out from the public
+    // TryDeferredTextureCopy so Fix A can be tried first.
+    bool TryAsyncMemcpyCopy(const Pica::DisplayTransferConfig& config);
 };
 
 } // namespace Vulkan
