@@ -747,6 +747,136 @@ void apply_mali_patches() {
     LOGI("patch: Mali G52 null-check trampolines installed (4 sites)");
 }
 
+// -------- Hang watchdog --------
+//
+// After 30-45 min of MK7 course-preview cycling the VulkanWorker thread
+// ends up at 100% CPU inside the patch 3 skip-slot -> patch 4 early-return
+// spin loop. Mali's internal state is unrecoverable once it enters this
+// loop; no amount of additional null-checks has broken it. Rather than
+// leave the user with a frozen app requiring force-stop, we detect the
+// spin and clean-abort so Android will relaunch the activity cleanly.
+//
+// Detection: sample the system/user CPU time delta of the VulkanWorker
+// thread every 2 seconds. If user_time grows by ~200 ticks (= 100% of
+// 2 seconds at 100Hz) for N consecutive samples, call abort().
+// Legitimate heavy rendering rarely keeps VulkanWorker pegged at 100%
+// for that long (it's frequently in futex_wait between chunks).
+
+#include <pthread.h>
+#include <dirent.h>
+#include <signal.h>
+
+int read_comm(int tid, char* out, size_t n) {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/self/task/%d/comm", tid);
+    FILE* f = std::fopen(path, "r");
+    if (!f) return -1;
+    if (!std::fgets(out, (int)n, f)) { std::fclose(f); return -1; }
+    std::fclose(f);
+    size_t len = std::strlen(out);
+    if (len && out[len - 1] == '\n') out[len - 1] = 0;
+    return 0;
+}
+
+long read_utime(int tid) {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+    FILE* f = std::fopen(path, "r");
+    if (!f) return -1;
+    char buf[512];
+    if (!std::fgets(buf, sizeof(buf), f)) { std::fclose(f); return -1; }
+    std::fclose(f);
+    // field 14 is utime. Need to skip past "(comm)" because comm can have spaces.
+    char* p = std::strrchr(buf, ')');
+    if (!p) return -1;
+    p++;  // past ')'
+    // Now we're at field 3 (state), need 14, so skip 11 more fields.
+    for (int i = 0; i < 11; ++i) {
+        while (*p == ' ') p++;
+        while (*p && *p != ' ') p++;
+    }
+    return std::strtol(p, nullptr, 10);
+}
+
+int find_vulkan_worker_tid() {
+    DIR* d = opendir("/proc/self/task");
+    if (!d) return -1;
+    int result = -1;
+    struct dirent* e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        int tid = atoi(e->d_name);
+        char comm[64];
+        if (read_comm(tid, comm, sizeof(comm)) < 0) continue;
+        if (std::strcmp(comm, "VulkanWorker") == 0) { result = tid; break; }
+    }
+    closedir(d);
+    return result;
+}
+
+void* watchdog_main(void*) {
+    pthread_setname_np(pthread_self(), "MaliWatchdog");
+
+    // Wait a bit for VulkanWorker to spawn
+    sleep(15);
+
+    int tid = find_vulkan_worker_tid();
+    if (tid < 0) {
+        LOGE("watchdog: could not find VulkanWorker thread; watchdog disabled");
+        return nullptr;
+    }
+    LOGI("watchdog: monitoring VulkanWorker tid=%d", tid);
+
+    // Spin-detection: if utime grows by ~200 ticks over 2 seconds (= 100% CPU
+    // for the whole interval) for 5 consecutive checks, we declare a hang.
+    // 10 seconds of continuous 100% CPU is the threshold; legitimate workloads
+    // normally have SOME futex_wait time between command chunks.
+    const int THRESHOLD_TICKS_PER_2S = 190;
+    const int CONSECUTIVE_HITS = 5;
+
+    long prev = read_utime(tid);
+    int hits = 0;
+    while (true) {
+        sleep(2);
+        long cur = read_utime(tid);
+        if (cur < 0) {
+            LOGE("watchdog: read_utime failed; thread gone?");
+            return nullptr;
+        }
+        long delta = cur - prev;
+        prev = cur;
+        if (delta >= THRESHOLD_TICKS_PER_2S) {
+            hits++;
+            LOGE("watchdog: VulkanWorker busy %ld ticks/2s (hit %d/%d)", delta, hits, CONSECUTIVE_HITS);
+            if (hits >= CONSECUTIVE_HITS) {
+                LOGE("watchdog: HANG DETECTED - aborting for clean restart");
+                // Give a moment for the log to flush then abort. Android will
+                // relaunch the activity cleanly; user loses the frozen session
+                // but gets back in seconds instead of force-stopping a dead app.
+                usleep(100000);
+                abort();
+            }
+        } else {
+            if (hits > 0) LOGI("watchdog: VulkanWorker recovered (%ld ticks/2s)", delta);
+            hits = 0;
+        }
+    }
+    return nullptr;
+}
+
+void start_watchdog_once() {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, []() {
+        pthread_t t;
+        if (pthread_create(&t, nullptr, watchdog_main, nullptr) == 0) {
+            pthread_detach(t);
+            LOGI("watchdog: thread started");
+        } else {
+            LOGE("watchdog: failed to start thread");
+        }
+    });
+}
+
 } // namespace
 
 VKAPI_ATTR VkResult VKAPI_CALL L_CreateInstance(
@@ -789,6 +919,11 @@ VKAPI_ATTR VkResult VKAPI_CALL L_CreateInstance(
     // guaranteed to be mapped. Safe to call on non-Mali devices - the
     // patcher bails gracefully if the library isn't present.
     apply_mali_patches();
+
+    // Start the hang-watchdog thread (one-shot). Detects VulkanWorker
+    // spin-at-100%-CPU and aborts so Android relaunches the activity
+    // instead of leaving the user with a frozen app.
+    start_watchdog_once();
 
     return VK_SUCCESS;
 }
