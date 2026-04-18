@@ -500,6 +500,212 @@ DEVWRAP_RESULT(GetQueryPoolResults, (VkDevice d, VkQueryPool p, uint32_t fq, uin
 
 // -------- Create / destroy instance & device --------
 
+// -------- In-process binary patch for libGLES_mali.so --------
+//
+// The Mali G52 r25p0 driver has two TOCTOU-style null-deref bugs in its
+// internal dispatch helpers:
+//
+//   libGLES_mali.so  +0x1e05a38  ldr x21, [x8, #96]   (x8 was [x0+32], can be NULL)
+//                                                     → fault addr 0x60
+//   libGLES_mali.so  +0x09e5014  ldr w13, [x23, #8]   (x23 was [x19+72+8], can be NULL)
+//                                                     → fault addr 0x8
+//
+// On our layer's first CreateInstance (when Mali is definitely mapped into
+// our process) we locate libGLES_mali.so's base and plant trampolines:
+// each crash-site's ldr becomes `b cave`, and the cave we occupy (a
+// 224-byte zero region at offset 0x1f62f20 that sits in libGLES_mali's
+// .text) does a null check and an early-exit to the function's epilogue
+// when the loaded pointer is NULL.
+//
+// SELinux must be permissive for this to work: `mprotect(PROT_WRITE)` on
+// a file-backed executable mapping requires `execmod` permission that
+// stock enforcing policy does not grant to untrusted_app. Enforcing mode
+// makes the mprotect fail with EACCES; we log the error and leave the
+// driver untouched. The mutex-serialisation side of the layer still works.
+
+#include <cstdio>
+#include <unistd.h>
+#include <sys/mman.h>
+
+namespace {
+
+bool g_mali_patched = false;
+std::mutex g_mali_patch_mtx;
+
+uintptr_t find_mali_base() {
+    FILE* f = std::fopen("/proc/self/maps", "r");
+    if (!f) return 0;
+    char line[1024];
+    uintptr_t result = 0;
+    while (std::fgets(line, sizeof(line), f)) {
+        // Executable segment of libGLES_mali.so. We want the mapping whose
+        // file offset is 0, because the patch offsets we computed are
+        // relative to the file start, not the executable segment start.
+        if (std::strstr(line, "/libGLES_mali.so")) {
+            uintptr_t start = 0, end = 0, off = 0;
+            char perms[8] = {0};
+            int n = std::sscanf(line, "%lx-%lx %7s %lx", &start, &end, perms, &off);
+            if (n >= 4 && off == 0) {
+                result = start;
+                break;
+            }
+        }
+    }
+    std::fclose(f);
+    return result;
+}
+
+// Write `len` bytes at `dst` across page boundaries, flipping mprotect
+// on the affected pages. Returns false if mprotect fails.
+bool write_patch(void* dst, const void* src, size_t len) {
+    const uintptr_t pg = sysconf(_SC_PAGESIZE);
+    uintptr_t lo = reinterpret_cast<uintptr_t>(dst) & ~(pg - 1);
+    uintptr_t hi = (reinterpret_cast<uintptr_t>(dst) + len + pg - 1) & ~(pg - 1);
+    size_t span = hi - lo;
+
+    if (mprotect(reinterpret_cast<void*>(lo), span, PROT_READ | PROT_WRITE) != 0) {
+        LOGE("mprotect RW failed at %p span %zu: %s", (void*)lo, span, std::strerror(errno));
+        return false;
+    }
+    std::memcpy(dst, src, len);
+    if (mprotect(reinterpret_cast<void*>(lo), span, PROT_READ | PROT_EXEC) != 0) {
+        LOGE("mprotect RX failed at %p span %zu: %s", (void*)lo, span, std::strerror(errno));
+        return false;
+    }
+    __builtin___clear_cache(static_cast<char*>(dst), static_cast<char*>(dst) + len);
+    return true;
+}
+
+void apply_mali_patches() {
+    std::lock_guard<std::mutex> g(g_mali_patch_mtx);
+    if (g_mali_patched) return;
+
+    uintptr_t base = find_mali_base();
+    if (!base) {
+        LOGI("patch: libGLES_mali.so not mapped; skipping (non-Mali device?)");
+        g_mali_patched = true;  // don't keep retrying
+        return;
+    }
+    LOGI("patch: libGLES_mali.so base=0x%lx", base);
+
+    // Precomputed bytes verified against the on-disk patch + objdump.
+    // See mali-re/patch_mali.py for the derivation.
+    constexpr uintptr_t OFF_CRASH1 = 0x1e05a38;
+    constexpr uintptr_t OFF_CRASH2 = 0x009e5014;
+    constexpr uintptr_t OFF_CRASH3 = 0x009e5058;  // ldr x14, [x15, #8], x15 can be NULL
+    constexpr uintptr_t OFF_CAVE1  = 0x1f62f20;   // trampoline 1 slot
+    constexpr uintptr_t OFF_CAVE2  = 0x1f62f40;   // trampoline 2 slot (+32)
+    constexpr uintptr_t OFF_CAVE3  = 0x1f62f60;   // trampoline 3 slot (+64)
+
+    constexpr uint32_t ORIG_CRASH1 = 0xf9403115;  // ldr x21, [x8, #96]
+    constexpr uint32_t ORIG_CRASH2 = 0xb9400aed;  // ldr w13, [x23, #8]
+    constexpr uint32_t ORIG_CRASH3 = 0xf94005ee;  // ldr x14, [x15, #8]
+
+    // Trampoline 1 (20 bytes): null-check x8, do the load, then either
+    // fall through or early-return via epilogue at 0x1e05ae4 with w22=0.
+    const uint32_t tramp1[5] = {
+        0xb4000068,   // cbz  x8, +12
+        0xf9403115,   // ldr  x21, [x8, #96]
+        0x17fa8ac5,   // b    0x1e05a3c (back to insn after patched site)
+        0x2a1f03f6,   // mov  w22, wzr
+        0x17fa8aed,   // b    0x1e05ae4 (stack-canary check + epilogue)
+    };
+    // Patch at 0x1e05a38: b 0x1f62f20
+    const uint32_t patch1 = 0x1405753a;
+
+    // Trampoline 2 (20 bytes): null-check x23, do the load, then either
+    // fall through or early-return via epilogue at 0x9e5258 with w0=0.
+    const uint32_t tramp2[5] = {
+        0xb4000077,   // cbz  x23, +12
+        0xb9400aed,   // ldr  w13, [x23, #8]
+        0x17aa0834,   // b    0x9e5018  (back to insn after patched site)
+        0x2a1f03e0,   // mov  w0, wzr
+        0x17aa0842,   // b    0x9e5258  (stack-canary check + epilogue)
+    };
+    // Patch at 0x9e5014: b 0x1f62f40
+    const uint32_t patch2 = 0x1455f7cb;
+
+    // Trampoline 3 (36 bytes): the pointer chase here is `[x23][x12*8]`
+    // where the table-slot `x15` can be transiently NULL during another
+    // Mali thread's fixup. Just bailing to the epilogue in that case made
+    // Mali's own queue-waiter thread spin forever at 100% CPU (it waits
+    // for the completion of work our early-return skipped). So: retry
+    // loading x15 from its memory source a bounded number of times before
+    // giving up — gives the other thread room to finish its write.
+    //
+    //   mov   w16, #1024                   ; bounded retry counter
+    // .retry:
+    //   cbnz  x15, .have
+    //   ldr   x15, [x13, x12, lsl #3]      ; re-read the table slot
+    //   subs  w16, w16, #1
+    //   b.ne  .retry
+    //   mov   w0, wzr                      ; counter exhausted; fall back
+    //   b     0x9e5258
+    // .have:
+    //   ldr   x14, [x15, #8]               ; original load, now safe
+    //   b     0x9e505c                     ; resume
+    //
+    // w16 is safe scratch at this call site - Mali hasn't assigned x16
+    // here yet; first use is at 0x9e5070 (`mov x16, x13`).
+    const uint32_t tramp3[9] = {
+        0x52808010,   // mov   w16, #1024
+        0xb50000cf,   // cbnz  x15, +24  (to .have)
+        0xf86c79af,   // ldr   x15, [x13, x12, lsl #3]
+        0x71000610,   // subs  w16, w16, #1
+        0x54ffffa1,   // b.ne  -12  (back to cbnz)
+        0x2a1f03e0,   // mov   w0, wzr
+        0x17aa0838,   // b     0x9e5258
+        0xf94005ee,   // ldr   x14, [x15, #8]
+        0x17aa0837,   // b     0x9e505c
+    };
+    // Patch at 0x9e5058: b 0x1f62f60
+    const uint32_t patch3 = 0x1455f7c2;
+
+    uint32_t* crash1 = reinterpret_cast<uint32_t*>(base + OFF_CRASH1);
+    uint32_t* crash2 = reinterpret_cast<uint32_t*>(base + OFF_CRASH2);
+    uint32_t* crash3 = reinterpret_cast<uint32_t*>(base + OFF_CRASH3);
+    uint32_t* cave1  = reinterpret_cast<uint32_t*>(base + OFF_CAVE1);
+    uint32_t* cave2  = reinterpret_cast<uint32_t*>(base + OFF_CAVE2);
+    uint32_t* cave3  = reinterpret_cast<uint32_t*>(base + OFF_CAVE3);
+
+    if (*crash1 != ORIG_CRASH1) {
+        LOGE("patch: unexpected insn at crash1: 0x%08x (expected 0x%08x); driver changed?", *crash1, ORIG_CRASH1);
+        g_mali_patched = true;
+        return;
+    }
+    if (*crash2 != ORIG_CRASH2) {
+        LOGE("patch: unexpected insn at crash2: 0x%08x (expected 0x%08x); driver changed?", *crash2, ORIG_CRASH2);
+        g_mali_patched = true;
+        return;
+    }
+    if (*crash3 != ORIG_CRASH3) {
+        LOGE("patch: unexpected insn at crash3: 0x%08x (expected 0x%08x); driver changed?", *crash3, ORIG_CRASH3);
+        g_mali_patched = true;
+        return;
+    }
+    // Cave sanity: make sure no one else already patched these slots.
+    // Trampolines 1 & 2 are 5 insns each; trampoline 3 (retry loop) is 9.
+    for (int i = 0; i < 5; ++i) {
+        if (cave1[i] != 0) { LOGE("patch: cave1 dirty at +%d: 0x%08x", i, cave1[i]); g_mali_patched = true; return; }
+        if (cave2[i] != 0) { LOGE("patch: cave2 dirty at +%d: 0x%08x", i, cave2[i]); g_mali_patched = true; return; }
+    }
+    for (int i = 0; i < 9; ++i) {
+        if (cave3[i] != 0) { LOGE("patch: cave3 dirty at +%d: 0x%08x", i, cave3[i]); g_mali_patched = true; return; }
+    }
+
+    if (!write_patch(cave1, tramp1, sizeof(tramp1))) return;
+    if (!write_patch(cave2, tramp2, sizeof(tramp2))) return;
+    if (!write_patch(cave3, tramp3, sizeof(tramp3))) return;
+    if (!write_patch(crash1, &patch1, sizeof(patch1))) return;
+    if (!write_patch(crash2, &patch2, sizeof(patch2))) return;
+    if (!write_patch(crash3, &patch3, sizeof(patch3))) return;
+
+    g_mali_patched = true;
+    LOGI("patch: Mali G52 null-check trampolines installed (3 sites)");
+}
+
+} // namespace
+
 VKAPI_ATTR VkResult VKAPI_CALL L_CreateInstance(
     const VkInstanceCreateInfo* pCreateInfo,
     const VkAllocationCallbacks* pAllocator,
@@ -535,6 +741,12 @@ VKAPI_ATTR VkResult VKAPI_CALL L_CreateInstance(
         g_inst_ready = true;
     }
     LOGI("layer loaded; instance=%p", *pInstance);
+
+    // Apply the in-process binary patches now that libGLES_mali.so is
+    // guaranteed to be mapped. Safe to call on non-Mali devices - the
+    // patcher bails gracefully if the library isn't present.
+    apply_mali_patches();
+
     return VK_SUCCESS;
 }
 
