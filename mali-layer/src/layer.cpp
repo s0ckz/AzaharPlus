@@ -616,17 +616,20 @@ void apply_mali_patches() {
     constexpr uintptr_t OFF_CRASH3 = 0x009e5058;  // ldr x14, [x15, #8], x15 can be NULL
     constexpr uintptr_t OFF_CRASH4 = 0x009e50b4;  // ldr x14, [x23]   , x23 can be NULL
     constexpr uintptr_t OFF_CRASH6 = 0x01f6669c;  // ldr x0, [x0, #16], x0 can be 0x8 (near-null)
+    constexpr uintptr_t OFF_CRASH7 = 0x01f6840c;  // ldr x21, [x0, #24], x0 can be 0x20 (near-null)
     constexpr uintptr_t OFF_CAVE1  = 0x1f62f20;   // trampoline 1 slot
     constexpr uintptr_t OFF_CAVE2  = 0x1f62f40;   // trampoline 2 slot (+32)
     constexpr uintptr_t OFF_CAVE3  = 0x1f62f60;   // trampoline 3 slot (+64)
     constexpr uintptr_t OFF_CAVE4  = 0x1f62f80;   // trampoline 4 slot (+96)
     constexpr uintptr_t OFF_CAVE6  = 0x1f62fc0;   // trampoline 6 slot (+160)
+    constexpr uintptr_t OFF_CAVE7  = 0x1f62fe0;   // trampoline 7 slot (+192)
 
     constexpr uint32_t ORIG_CRASH1 = 0xf9403115;  // ldr x21, [x8, #96]
     constexpr uint32_t ORIG_CRASH2 = 0xb9400aed;  // ldr w13, [x23, #8]
     constexpr uint32_t ORIG_CRASH3 = 0xf94005ee;  // ldr x14, [x15, #8]
     constexpr uint32_t ORIG_CRASH4 = 0xf94002ee;  // ldr x14, [x23]
     constexpr uint32_t ORIG_CRASH6 = 0xf9400800;  // ldr x0, [x0, #16]
+    constexpr uint32_t ORIG_CRASH7 = 0xf9400c15;  // ldr x21, [x0, #24]
 
     // Trampoline 1 (20 bytes): null-check x8, do the load, then either
     // fall through or early-return via epilogue at 0x1e05ae4 with w22=0.
@@ -726,16 +729,44 @@ void apply_mali_patches() {
     // Patch at 0x1f6669c: b 0x1f62fc0
     const uint32_t patch6 = 0x17fff249;
 
+    // Trampoline 7 (24 bytes): guard `ldr x21, [x0, #24]` at 0x1f6840c inside
+    // another Mali function called from vkQueueSubmit. Observed crash:
+    // x0 = 0x20 (near-null), fault at 0x38 = x0 + 24. Same class as patch 6
+    // but different function (0x1f68400 vs 0x1f66680).
+    //
+    // Function layout: stp x30,x21 saved, stp x20,x19 saved, THEN the crash.
+    // Safe skip: restore sp + x30 via ldp at 0x1f68430's ldp, then ret.
+    //
+    //   cmp x0, #0x1000
+    //   b.lo .bad
+    //   ldr x21, [x0, #24]      ; original
+    //   b   0x1f68410            ; resume at next insn
+    // .bad:
+    //   ldp x30, x21, [sp], #32  ; restore sp + x30
+    //   ret                      ; clean return to caller
+    const uint32_t tramp7[6] = {
+        0xf140041f,   // cmp  x0, #0x1000 (shift LSL 12)
+        0x54000063,   // b.lo +12
+        0xf9400c15,   // ldr  x21, [x0, #24]   (original)
+        0x14001509,   // b    0x1f68410
+        0xa8c257fe,   // ldp  x30, x21, [sp], #32
+        0xd65f03c0,   // ret
+    };
+    // Patch at 0x1f6840c: b 0x1f62fe0
+    const uint32_t patch7 = 0x17ffeaf5;
+
     uint32_t* crash1 = reinterpret_cast<uint32_t*>(base + OFF_CRASH1);
     uint32_t* crash2 = reinterpret_cast<uint32_t*>(base + OFF_CRASH2);
     uint32_t* crash3 = reinterpret_cast<uint32_t*>(base + OFF_CRASH3);
     uint32_t* crash4 = reinterpret_cast<uint32_t*>(base + OFF_CRASH4);
     uint32_t* crash6 = reinterpret_cast<uint32_t*>(base + OFF_CRASH6);
+    uint32_t* crash7 = reinterpret_cast<uint32_t*>(base + OFF_CRASH7);
     uint32_t* cave1  = reinterpret_cast<uint32_t*>(base + OFF_CAVE1);
     uint32_t* cave2  = reinterpret_cast<uint32_t*>(base + OFF_CAVE2);
     uint32_t* cave3  = reinterpret_cast<uint32_t*>(base + OFF_CAVE3);
     uint32_t* cave4  = reinterpret_cast<uint32_t*>(base + OFF_CAVE4);
     uint32_t* cave6  = reinterpret_cast<uint32_t*>(base + OFF_CAVE6);
+    uint32_t* cave7  = reinterpret_cast<uint32_t*>(base + OFF_CAVE7);
 
     if (*crash1 != ORIG_CRASH1) {
         LOGE("patch: unexpected insn at crash1: 0x%08x (expected 0x%08x); driver changed?", *crash1, ORIG_CRASH1);
@@ -762,8 +793,13 @@ void apply_mali_patches() {
         g_mali_patched = true;
         return;
     }
+    if (*crash7 != ORIG_CRASH7) {
+        LOGE("patch: unexpected insn at crash7: 0x%08x (expected 0x%08x); driver changed?", *crash7, ORIG_CRASH7);
+        g_mali_patched = true;
+        return;
+    }
     // Cave sanity: make sure no one else already patched these slots.
-    // Trampolines 1, 2, 4 are 5 insns each; 3 is 4; 6 is 6.
+    // Trampolines 1, 2, 4 are 5 insns each; 3 is 4; 6 and 7 are 6.
     for (int i = 0; i < 5; ++i) {
         if (cave1[i] != 0) { LOGE("patch: cave1 dirty at +%d: 0x%08x", i, cave1[i]); g_mali_patched = true; return; }
         if (cave2[i] != 0) { LOGE("patch: cave2 dirty at +%d: 0x%08x", i, cave2[i]); g_mali_patched = true; return; }
@@ -774,6 +810,7 @@ void apply_mali_patches() {
     }
     for (int i = 0; i < 6; ++i) {
         if (cave6[i] != 0) { LOGE("patch: cave6 dirty at +%d: 0x%08x", i, cave6[i]); g_mali_patched = true; return; }
+        if (cave7[i] != 0) { LOGE("patch: cave7 dirty at +%d: 0x%08x", i, cave7[i]); g_mali_patched = true; return; }
     }
 
     if (!write_patch(cave1, tramp1, sizeof(tramp1))) return;
@@ -781,14 +818,16 @@ void apply_mali_patches() {
     if (!write_patch(cave3, tramp3, sizeof(tramp3))) return;
     if (!write_patch(cave4, tramp4, sizeof(tramp4))) return;
     if (!write_patch(cave6, tramp6, sizeof(tramp6))) return;
+    if (!write_patch(cave7, tramp7, sizeof(tramp7))) return;
     if (!write_patch(crash1, &patch1, sizeof(patch1))) return;
     if (!write_patch(crash2, &patch2, sizeof(patch2))) return;
     if (!write_patch(crash3, &patch3, sizeof(patch3))) return;
     if (!write_patch(crash4, &patch4, sizeof(patch4))) return;
     if (!write_patch(crash6, &patch6, sizeof(patch6))) return;
+    if (!write_patch(crash7, &patch7, sizeof(patch7))) return;
 
     g_mali_patched = true;
-    LOGI("patch: Mali G52 null-check trampolines installed (5 sites: 1-4 + 6)");
+    LOGI("patch: Mali G52 null-check trampolines installed (6 sites: 1-4 + 6,7)");
 }
 
 // -------- Hang watchdog --------
