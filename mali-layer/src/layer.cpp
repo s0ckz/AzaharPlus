@@ -449,7 +449,26 @@ DEVWRAP_RESULT(CreateDescriptorSetLayout, (VkDevice d, const VkDescriptorSetLayo
 DEVWRAP_VOID(DestroyDescriptorSetLayout, (VkDevice d, VkDescriptorSetLayout dsl, const VkAllocationCallbacks* a), (d, dsl, a))
 DEVWRAP_RESULT(CreateDescriptorPool, (VkDevice d, const VkDescriptorPoolCreateInfo* ci, const VkAllocationCallbacks* a, VkDescriptorPool* p), (d, ci, a, p))
 DEVWRAP_VOID(DestroyDescriptorPool, (VkDevice d, VkDescriptorPool p, const VkAllocationCallbacks* a), (d, p, a))
-DEVWRAP_RESULT(CreateRenderPass, (VkDevice d, const VkRenderPassCreateInfo* ci, const VkAllocationCallbacks* a, VkRenderPass* r), (d, ci, a, r))
+// Diagnostic wrapper: prove whether Azahar's cached dispatch actually lands
+// here during hangs, and report the returned handle so we can tell if Mali
+// is giving us null-but-success (which would cause Azahar to retry).
+VKAPI_ATTR VkResult VKAPI_CALL L_CreateRenderPass(
+    VkDevice d, const VkRenderPassCreateInfo* ci, const VkAllocationCallbacks* a, VkRenderPass* r) {
+    static int calls = 0;
+    int n = __atomic_add_fetch(&calls, 1, __ATOMIC_RELAXED);
+    DeviceDispatch* dd = get_dev(d);
+    VkResult res;
+    {
+        LockGuard _g;
+        res = dd->CreateRenderPass(d, ci, a, r);
+    }
+    if (n <= 5 || (n & 0xff) == 0) {
+        LOGI("L_CreateRenderPass #%d -> res=%d handle=%p (atts=%u subpasses=%u)",
+             n, (int)res, r ? (void*)(uintptr_t)*r : nullptr,
+             ci ? ci->attachmentCount : 0, ci ? ci->subpassCount : 0);
+    }
+    return res;
+}
 DEVWRAP_VOID(DestroyRenderPass, (VkDevice d, VkRenderPass r, const VkAllocationCallbacks* a), (d, r, a))
 DEVWRAP_RESULT(CreateFramebuffer, (VkDevice d, const VkFramebufferCreateInfo* ci, const VkAllocationCallbacks* a, VkFramebuffer* f), (d, ci, a, f))
 DEVWRAP_VOID(DestroyFramebuffer, (VkDevice d, VkFramebuffer f, const VkAllocationCallbacks* a), (d, f, a))
@@ -593,13 +612,16 @@ void apply_mali_patches() {
     constexpr uintptr_t OFF_CRASH1 = 0x1e05a38;
     constexpr uintptr_t OFF_CRASH2 = 0x009e5014;
     constexpr uintptr_t OFF_CRASH3 = 0x009e5058;  // ldr x14, [x15, #8], x15 can be NULL
+    constexpr uintptr_t OFF_CRASH4 = 0x009e50b4;  // ldr x14, [x23]   , x23 can be NULL
     constexpr uintptr_t OFF_CAVE1  = 0x1f62f20;   // trampoline 1 slot
     constexpr uintptr_t OFF_CAVE2  = 0x1f62f40;   // trampoline 2 slot (+32)
     constexpr uintptr_t OFF_CAVE3  = 0x1f62f60;   // trampoline 3 slot (+64)
+    constexpr uintptr_t OFF_CAVE4  = 0x1f62f80;   // trampoline 4 slot (+96)
 
     constexpr uint32_t ORIG_CRASH1 = 0xf9403115;  // ldr x21, [x8, #96]
     constexpr uint32_t ORIG_CRASH2 = 0xb9400aed;  // ldr w13, [x23, #8]
     constexpr uint32_t ORIG_CRASH3 = 0xf94005ee;  // ldr x14, [x15, #8]
+    constexpr uint32_t ORIG_CRASH4 = 0xf94002ee;  // ldr x14, [x23]
 
     // Trampoline 1 (20 bytes): null-check x8, do the load, then either
     // fall through or early-return via epilogue at 0x1e05ae4 with w22=0.
@@ -625,48 +647,61 @@ void apply_mali_patches() {
     // Patch at 0x9e5014: b 0x1f62f40
     const uint32_t patch2 = 0x1455f7cb;
 
-    // Trampoline 3 (36 bytes): the pointer chase here is `[x23][x12*8]`
-    // where the table-slot `x15` can be transiently NULL during another
-    // Mali thread's fixup. Just bailing to the epilogue in that case made
-    // Mali's own queue-waiter thread spin forever at 100% CPU (it waits
-    // for the completion of work our early-return skipped). So: retry
-    // loading x15 from its memory source a bounded number of times before
-    // giving up — gives the other thread room to finish its write.
+    // Trampoline 3 (16 bytes): pointer chase [x23][x12*8] → x15. When x15
+    // is NULL, neither "early-return via epilogue" nor "retry loop" work
+    // cleanly:
+    //   - early-return: makes Mali's own queue-waiter spin at 100% CPU
+    //     for completions that never arrive (observed hang at ~26 min).
+    //   - retry loop: spins reading [x13,x12*8] which can be freed by
+    //     Mali's internal lifecycle thread mid-retry, producing a
+    //     "SEGV fault addr garbage" when we re-read past free (~60 min).
     //
-    //   mov   w16, #1024                   ; bounded retry counter
-    // .retry:
-    //   cbnz  x15, .have
-    //   ldr   x15, [x13, x12, lsl #3]      ; re-read the table slot
-    //   subs  w16, w16, #1
-    //   b.ne  .retry
-    //   mov   w0, wzr                      ; counter exhausted; fall back
-    //   b     0x9e5258
+    // The right answer is in the function itself: at 0x9e504c there's a
+    // `cbz w13, 9e50a0` — if the byte check flags the slot as empty,
+    // the function branches to 0x9e50a0 which handles "this slot's empty,
+    // try the next index". We mimic that path for a NULL pointer.
+    //
+    //   cbnz  x15, .have        ; pointer non-null → normal load
+    //   b     0x9e50a0          ; null → take Mali's own "skip-slot" branch
     // .have:
-    //   ldr   x14, [x15, #8]               ; original load, now safe
-    //   b     0x9e505c                     ; resume
-    //
-    // w16 is safe scratch at this call site - Mali hasn't assigned x16
-    // here yet; first use is at 0x9e5070 (`mov x16, x13`).
-    const uint32_t tramp3[9] = {
-        0x52808010,   // mov   w16, #1024
-        0xb50000cf,   // cbnz  x15, +24  (to .have)
-        0xf86c79af,   // ldr   x15, [x13, x12, lsl #3]
-        0x71000610,   // subs  w16, w16, #1
-        0x54ffffa1,   // b.ne  -12  (back to cbnz)
-        0x2a1f03e0,   // mov   w0, wzr
-        0x17aa0838,   // b     0x9e5258
+    //   ldr   x14, [x15, #8]    ; original load
+    //   b     0x9e505c          ; resume
+    const uint32_t tramp3[4] = {
+        0xb500004f,   // cbnz  x15, +8  (to .have)
+        0x17aa084f,   // b     0x9e50a0
         0xf94005ee,   // ldr   x14, [x15, #8]
-        0x17aa0837,   // b     0x9e505c
+        0x17aa083c,   // b     0x9e505c
     };
     // Patch at 0x9e5058: b 0x1f62f60
     const uint32_t patch3 = 0x1455f7c2;
 
+    // Trampoline 4 (20 bytes): mirrors patch 2 for the OTHER `ldr *, [x23]`
+    // load in the same function. After patch 3 sends execution into the
+    // "try next slot" branch at 0x9e50a0, the function reaches 0x9e50b4
+    // where it dereferences x23 again - but x23 can be NULL by then
+    // (Mali's internal thread frees [x19, #72+8] between the first and
+    // second reads). Same null-check + epilogue early-return as patch 2.
+    const uint32_t tramp4[5] = {
+        0xb4000077,   // cbz   x23, +12
+        0xf94002ee,   // ldr   x14, [x23]
+        0x17aa084c,   // b     0x9e50b8
+        0x2a1f03e0,   // mov   w0, wzr    (tried w0=1 to break caller's
+                      //                    while(result==0) loop - hung at
+                      //                    7 min instead of 45, confirms
+                      //                    caller isn't a success-retry loop)
+        0x17aa0832,   // b     0x9e5258
+    };
+    // Patch at 0x9e50b4: b 0x1f62f80
+    const uint32_t patch4 = 0x1455f7b3;
+
     uint32_t* crash1 = reinterpret_cast<uint32_t*>(base + OFF_CRASH1);
     uint32_t* crash2 = reinterpret_cast<uint32_t*>(base + OFF_CRASH2);
     uint32_t* crash3 = reinterpret_cast<uint32_t*>(base + OFF_CRASH3);
+    uint32_t* crash4 = reinterpret_cast<uint32_t*>(base + OFF_CRASH4);
     uint32_t* cave1  = reinterpret_cast<uint32_t*>(base + OFF_CAVE1);
     uint32_t* cave2  = reinterpret_cast<uint32_t*>(base + OFF_CAVE2);
     uint32_t* cave3  = reinterpret_cast<uint32_t*>(base + OFF_CAVE3);
+    uint32_t* cave4  = reinterpret_cast<uint32_t*>(base + OFF_CAVE4);
 
     if (*crash1 != ORIG_CRASH1) {
         LOGE("patch: unexpected insn at crash1: 0x%08x (expected 0x%08x); driver changed?", *crash1, ORIG_CRASH1);
@@ -683,25 +718,33 @@ void apply_mali_patches() {
         g_mali_patched = true;
         return;
     }
+    if (*crash4 != ORIG_CRASH4) {
+        LOGE("patch: unexpected insn at crash4: 0x%08x (expected 0x%08x); driver changed?", *crash4, ORIG_CRASH4);
+        g_mali_patched = true;
+        return;
+    }
     // Cave sanity: make sure no one else already patched these slots.
-    // Trampolines 1 & 2 are 5 insns each; trampoline 3 (retry loop) is 9.
+    // Trampolines 1, 2, 4 are 5 insns each; trampoline 3 is 4 insns.
     for (int i = 0; i < 5; ++i) {
         if (cave1[i] != 0) { LOGE("patch: cave1 dirty at +%d: 0x%08x", i, cave1[i]); g_mali_patched = true; return; }
         if (cave2[i] != 0) { LOGE("patch: cave2 dirty at +%d: 0x%08x", i, cave2[i]); g_mali_patched = true; return; }
+        if (cave4[i] != 0) { LOGE("patch: cave4 dirty at +%d: 0x%08x", i, cave4[i]); g_mali_patched = true; return; }
     }
-    for (int i = 0; i < 9; ++i) {
+    for (int i = 0; i < 4; ++i) {
         if (cave3[i] != 0) { LOGE("patch: cave3 dirty at +%d: 0x%08x", i, cave3[i]); g_mali_patched = true; return; }
     }
 
     if (!write_patch(cave1, tramp1, sizeof(tramp1))) return;
     if (!write_patch(cave2, tramp2, sizeof(tramp2))) return;
     if (!write_patch(cave3, tramp3, sizeof(tramp3))) return;
+    if (!write_patch(cave4, tramp4, sizeof(tramp4))) return;
     if (!write_patch(crash1, &patch1, sizeof(patch1))) return;
     if (!write_patch(crash2, &patch2, sizeof(patch2))) return;
     if (!write_patch(crash3, &patch3, sizeof(patch3))) return;
+    if (!write_patch(crash4, &patch4, sizeof(patch4))) return;
 
     g_mali_patched = true;
-    LOGI("patch: Mali G52 null-check trampolines installed (3 sites)");
+    LOGI("patch: Mali G52 null-check trampolines installed (4 sites)");
 }
 
 } // namespace
