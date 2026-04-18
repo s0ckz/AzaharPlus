@@ -51,8 +51,10 @@ Scheduler::Scheduler(const Instance& instance)
     : master_semaphore{MakeMasterSemaphore(instance)},
       command_pool{instance, master_semaphore.get()}, use_worker_thread{true} {
     AllocateWorkerCommandBuffers();
+    // Always acquire a chunk so sync-mode code paths (use_worker_thread=false)
+    // have somewhere to record into.
+    AcquireNewChunk();
     if (use_worker_thread) {
-        AcquireNewChunk();
         worker_thread = std::jthread([this](std::stop_token token) { WorkerThread(token); });
     }
 }
@@ -105,12 +107,28 @@ void Scheduler::DispatchWork() {
 
 void Scheduler::DispatchWorkLocked() {
     // Caller MUST hold chunk_mutex.
-    if (!use_worker_thread || chunk->Empty()) {
+    if (chunk->Empty()) {
         return;
     }
 
     if (on_dispatch) {
         on_dispatch();
+    }
+
+    if (!use_worker_thread) {
+        // Synchronous path: run the chunk directly on the producer thread.
+        // chunk_mutex ensures only one producer is inside this at a time,
+        // so only one thread ever enters libGLES_mali.so - this sidesteps
+        // the Mali G52 concurrency bug that crashes/hangs when VulkanWorker
+        // runs concurrently with the producer.
+        const bool has_submit = chunk->HasSubmit();
+        chunk->ExecuteAll(current_cmdbuf);
+        if (has_submit) {
+            AllocateWorkerCommandBuffers();
+        }
+        // chunk->ExecuteAll resets the chunk's internal state; the same
+        // chunk instance is reused for subsequent Record calls.
+        return;
     }
 
     {
@@ -198,15 +216,13 @@ void Scheduler::SubmitExecution(vk::Semaphore signal_semaphore, vk::Semaphore wa
 
     master_semaphore->Refresh();
 
-    if (!use_worker_thread) {
-        AllocateWorkerCommandBuffers();
-    } else {
-        // Take chunk_mutex before MarkSubmit + DispatchWork so the
-        // sequence stays atomic against concurrent Record() calls.
-        std::scoped_lock chunk_lock{chunk_mutex};
-        chunk->MarkSubmit();
-        DispatchWorkLocked();
-    }
+    // Same sequence for both sync (use_worker_thread=false) and threaded
+    // modes: take chunk_mutex, mark submit, dispatch. DispatchWorkLocked
+    // handles the two-mode split internally - queuing to the worker in
+    // threaded mode, executing inline in sync mode.
+    std::scoped_lock chunk_lock{chunk_mutex};
+    chunk->MarkSubmit();
+    DispatchWorkLocked();
 }
 
 void Scheduler::AcquireNewChunk() {
