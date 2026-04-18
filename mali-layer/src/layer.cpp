@@ -550,6 +550,7 @@ namespace {
 
 bool g_mali_patched = false;
 std::mutex g_mali_patch_mtx;
+uintptr_t g_mali_base = 0;  // set by apply_mali_patches, read by watchdog/signal handler
 
 uintptr_t find_mali_base() {
     FILE* f = std::fopen("/proc/self/maps", "r");
@@ -605,6 +606,7 @@ void apply_mali_patches() {
         g_mali_patched = true;  // don't keep retrying
         return;
     }
+    g_mali_base = base;  // publish for the watchdog/signal handler
     LOGI("patch: libGLES_mali.so base=0x%lx", base);
 
     // Precomputed bytes verified against the on-disk patch + objdump.
@@ -765,6 +767,10 @@ void apply_mali_patches() {
 #include <pthread.h>
 #include <dirent.h>
 #include <signal.h>
+#include <sys/syscall.h>
+#include <ucontext.h>
+#include <atomic>
+#include <errno.h>
 
 int read_comm(int tid, char* out, size_t n) {
     char path[64];
@@ -814,6 +820,37 @@ int find_vulkan_worker_tid() {
     return result;
 }
 
+// Signal handler run on VulkanWorker when the watchdog tries to unstick
+// it. The signal context gives us VulkanWorker's full CPU state; if the
+// PC is inside the known Mali spin region (or our trampolines), we
+// rewrite it to 0x9e4fa0's epilogue with w0=0 so Mali's call returns
+// cleanly and the thread can pick up the next chunk. If the PC is
+// somewhere else, we leave it alone - don't want to crash on a
+// coincidental signal during unrelated work.
+volatile std::atomic<int> g_unstick_count{0};
+
+void unstick_signal_handler(int, siginfo_t*, void* ctx) {
+    if (!g_mali_base) return;
+    ucontext_t* uctx = static_cast<ucontext_t*>(ctx);
+    uint64_t pc = uctx->uc_mcontext.pc;
+    uint64_t off = pc - g_mali_base;
+
+    // Spin region: the 0x9e4fa0 function body + our trampolines 3 and 4.
+    bool in_spin =
+        (off >= 0x009e4fa0 && off <= 0x009e5280) ||   // the function body
+        (off >= 0x01f62f60 && off <= 0x01f62fa0);      // tramps 3 + 4
+
+    if (in_spin) {
+        // Jump to 0x9e4fa0's epilogue. The canary check in the epilogue
+        // will reload x8/x9 from stack and compare; if stack is intact
+        // (it should be - we're jumping WITHIN the function body) the
+        // epilogue runs ret to the caller.
+        uctx->uc_mcontext.pc = g_mali_base + 0x009e5258;
+        uctx->uc_mcontext.regs[0] = 0;  // w0 = 0 so caller sees success
+        g_unstick_count.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void* watchdog_main(void*) {
     pthread_setname_np(pthread_self(), "MaliWatchdog");
 
@@ -827,15 +864,31 @@ void* watchdog_main(void*) {
     }
     LOGI("watchdog: monitoring VulkanWorker tid=%d", tid);
 
+    // Install the unstick signal handler. We use SIGUSR1 because Azahar
+    // doesn't use it for anything else (Android's zygote uses SIGUSR1 for
+    // ART GC signals but the signal is process-scoped via pthread_kill
+    // when we target a specific tid, so ART isn't affected).
+    struct sigaction sa{};
+    sa.sa_sigaction = unstick_signal_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGUSR1, &sa, nullptr) != 0) {
+        LOGE("watchdog: sigaction(SIGUSR1) failed: %s", std::strerror(errno));
+    }
+
     // Spin-detection: if utime grows by ~200 ticks over 2 seconds (= 100% CPU
-    // for the whole interval) for 5 consecutive checks, we declare a hang.
-    // 10 seconds of continuous 100% CPU is the threshold; legitimate workloads
-    // normally have SOME futex_wait time between command chunks.
+    // for the whole interval) for 5 consecutive checks, we try to unstick.
+    // If unstick attempts don't release the thread for another 5 checks, abort.
     const int THRESHOLD_TICKS_PER_2S = 190;
-    const int CONSECUTIVE_HITS = 5;
+    const int UNSTICK_HITS = 5;
+    const int ABORT_HITS = 15;   // 30 seconds of sustained spin = unstick
+                                  // didn't work, kill the app for clean
+                                  // Android relaunch.
 
     long prev = read_utime(tid);
     int hits = 0;
+    int unstick_attempts = 0;
+    int last_unstick_count = 0;
     while (true) {
         sleep(2);
         long cur = read_utime(tid);
@@ -847,18 +900,43 @@ void* watchdog_main(void*) {
         prev = cur;
         if (delta >= THRESHOLD_TICKS_PER_2S) {
             hits++;
-            LOGE("watchdog: VulkanWorker busy %ld ticks/2s (hit %d/%d)", delta, hits, CONSECUTIVE_HITS);
-            if (hits >= CONSECUTIVE_HITS) {
-                LOGE("watchdog: HANG DETECTED - aborting for clean restart");
-                // Give a moment for the log to flush then abort. Android will
-                // relaunch the activity cleanly; user loses the frozen session
-                // but gets back in seconds instead of force-stopping a dead app.
+            if (hits == UNSTICK_HITS) {
+                LOGE("watchdog: spin detected, sending SIGUSR1 unstick signal");
+                pthread_kill(pthread_self(), 0);  // no-op: ensure tid is valid
+                int cnt_before = g_unstick_count.load(std::memory_order_relaxed);
+                // Send signal to VulkanWorker (same process). Must use tgkill
+                // via syscall (pthread_kill needs a pthread_t, which we don't
+                // have for a peer thread - just the TID).
+                syscall(__NR_tgkill, getpid(), tid, SIGUSR1);
+                unstick_attempts++;
+                usleep(50000);
+                int cnt_after = g_unstick_count.load(std::memory_order_relaxed);
+                if (cnt_after > cnt_before) {
+                    LOGI("watchdog: unstick attempt #%d applied (handler fired)",
+                         unstick_attempts);
+                    last_unstick_count = cnt_after;
+                } else {
+                    LOGE("watchdog: unstick signal didn't land on spin PC");
+                }
+            } else if (hits > UNSTICK_HITS && hits % 5 == 0) {
+                LOGE("watchdog: still spinning (%ld ticks/2s, hit %d) - retrying unstick",
+                     delta, hits);
+                syscall(__NR_tgkill, getpid(), tid, SIGUSR1);
+                unstick_attempts++;
+            }
+            if (hits >= ABORT_HITS) {
+                LOGE("watchdog: unstick exhausted (%d attempts) - aborting for clean restart",
+                     unstick_attempts);
                 usleep(100000);
                 abort();
             }
         } else {
-            if (hits > 0) LOGI("watchdog: VulkanWorker recovered (%ld ticks/2s)", delta);
+            if (hits > 0) {
+                LOGI("watchdog: VulkanWorker recovered after %d spin samples, %d unsticks (%ld ticks/2s now)",
+                     hits, unstick_attempts, delta);
+            }
             hits = 0;
+            unstick_attempts = 0;
         }
     }
     return nullptr;
