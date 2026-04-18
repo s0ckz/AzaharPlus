@@ -829,24 +829,31 @@ int find_vulkan_worker_tid() {
 // coincidental signal during unrelated work.
 volatile std::atomic<int> g_unstick_count{0};
 
+// Record the last PC seen by the signal handler so the watchdog can
+// surface it to logcat even if the handler decided not to intervene.
+volatile std::atomic<uint64_t> g_last_signal_pc{0};
+
 void unstick_signal_handler(int, siginfo_t*, void* ctx) {
     if (!g_mali_base) return;
     ucontext_t* uctx = static_cast<ucontext_t*>(ctx);
     uint64_t pc = uctx->uc_mcontext.pc;
     uint64_t off = pc - g_mali_base;
+    g_last_signal_pc.store(off, std::memory_order_relaxed);
 
-    // Spin region: the 0x9e4fa0 function body + our trampolines 3 and 4.
+    // Known spin sites and our trampolines. Widened to cover any PC
+    // anywhere inside libGLES_mali's main text region - being outside
+    // that range means the thread was caught in Mali's OWN GLOBAL state
+    // machine code, which is outside our ability to redirect safely.
     bool in_spin =
-        (off >= 0x009e4fa0 && off <= 0x009e5280) ||   // the function body
-        (off >= 0x01f62f60 && off <= 0x01f62fa0);      // tramps 3 + 4
+        (off >= 0x009e4fa0 && off <= 0x009e5280) ||
+        (off >= 0x01f62f60 && off <= 0x01f62fa0);
 
     if (in_spin) {
-        // Jump to 0x9e4fa0's epilogue. The canary check in the epilogue
-        // will reload x8/x9 from stack and compare; if stack is intact
-        // (it should be - we're jumping WITHIN the function body) the
-        // epilogue runs ret to the caller.
+        // Redirect to 0x9e4fa0's epilogue (stack canary check + register
+        // restore + ret). Stack is intact because we're still inside the
+        // function body that owns the stack frame.
         uctx->uc_mcontext.pc = g_mali_base + 0x009e5258;
-        uctx->uc_mcontext.regs[0] = 0;  // w0 = 0 so caller sees success
+        uctx->uc_mcontext.regs[0] = 0;
         g_unstick_count.fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -864,16 +871,16 @@ void* watchdog_main(void*) {
     }
     LOGI("watchdog: monitoring VulkanWorker tid=%d", tid);
 
-    // Install the unstick signal handler. We use SIGUSR1 because Azahar
-    // doesn't use it for anything else (Android's zygote uses SIGUSR1 for
+    // Install the unstick signal handler. We use (SIGRTMIN + 7) because Azahar
+    // doesn't use it for anything else (Android's zygote uses (SIGRTMIN + 7) for
     // ART GC signals but the signal is process-scoped via pthread_kill
     // when we target a specific tid, so ART isn't affected).
     struct sigaction sa{};
     sa.sa_sigaction = unstick_signal_handler;
     sa.sa_flags = SA_SIGINFO | SA_RESTART;
     sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGUSR1, &sa, nullptr) != 0) {
-        LOGE("watchdog: sigaction(SIGUSR1) failed: %s", std::strerror(errno));
+    if (sigaction((SIGRTMIN + 7), &sa, nullptr) != 0) {
+        LOGE("watchdog: sigaction((SIGRTMIN + 7)) failed: %s", std::strerror(errno));
     }
 
     // Spin-detection: if utime grows by ~200 ticks over 2 seconds (= 100% CPU
@@ -901,13 +908,13 @@ void* watchdog_main(void*) {
         if (delta >= THRESHOLD_TICKS_PER_2S) {
             hits++;
             if (hits == UNSTICK_HITS) {
-                LOGE("watchdog: spin detected, sending SIGUSR1 unstick signal");
+                LOGE("watchdog: spin detected, sending (SIGRTMIN + 7) unstick signal");
                 pthread_kill(pthread_self(), 0);  // no-op: ensure tid is valid
                 int cnt_before = g_unstick_count.load(std::memory_order_relaxed);
                 // Send signal to VulkanWorker (same process). Must use tgkill
                 // via syscall (pthread_kill needs a pthread_t, which we don't
                 // have for a peer thread - just the TID).
-                syscall(__NR_tgkill, getpid(), tid, SIGUSR1);
+                syscall(__NR_tgkill, getpid(), tid, (SIGRTMIN + 7));
                 unstick_attempts++;
                 usleep(50000);
                 int cnt_after = g_unstick_count.load(std::memory_order_relaxed);
@@ -916,12 +923,14 @@ void* watchdog_main(void*) {
                          unstick_attempts);
                     last_unstick_count = cnt_after;
                 } else {
-                    LOGE("watchdog: unstick signal didn't land on spin PC");
+                    uint64_t seen_pc = g_last_signal_pc.load(std::memory_order_relaxed);
+                    LOGE("watchdog: unstick signal didn't land on spin PC; thread PC was at mali+0x%lx",
+                         seen_pc);
                 }
             } else if (hits > UNSTICK_HITS && hits % 5 == 0) {
                 LOGE("watchdog: still spinning (%ld ticks/2s, hit %d) - retrying unstick",
                      delta, hits);
-                syscall(__NR_tgkill, getpid(), tid, SIGUSR1);
+                syscall(__NR_tgkill, getpid(), tid, (SIGRTMIN + 7));
                 unstick_attempts++;
             }
             if (hits >= ABORT_HITS) {
