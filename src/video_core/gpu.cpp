@@ -673,12 +673,6 @@ void GPU::VBlankOnWorker(s64 cycles_late) {
                  g_worker_exec_other.exchange(0),
                  g_worker_setbufferswap.exchange(0),
                  mmio_count);
-        LOG_INFO(HW_GPU,
-                 "GpuExecProbe cmdlist[n={} ms={:.2f}] dma[n={} ms={:.2f}] "
-                 "other[n={} ms={:.2f}]",
-                 g_gpu_exec.cmdlist_n, g_gpu_exec.cmdlist_ns / 1.0e6,
-                 g_gpu_exec.dma_n, g_gpu_exec.dma_ns / 1.0e6,
-                 g_gpu_exec.other_n, g_gpu_exec.other_ns / 1.0e6);
         // Per-cmdlist PICA register-write breakdown. `writes` is the number of
         // WriteInternalReg invocations taking the slow (switch-dispatch) path;
         // `burst_items` is items handled by the fast WriteBurstSameReg path,
@@ -750,18 +744,6 @@ void GPU::VBlankOnWorker(s64 cycles_late) {
                  swtc.memcpy_ns
                      ? (swtc.total_bytes / (swtc.memcpy_ns / 1.0e9)) / (1024.0 * 1024.0)
                      : 0.0);
-        LOG_INFO(HW_GPU,
-                 "TexXferProbe tc[accel={} ({:.2f}ms) sw={} ({:.2f}ms)] "
-                 "dt[accel={} ({:.2f}ms) sw={} ({:.2f}ms)] "
-                 "mf[accel={} ({:.2f}ms) sw={} ({:.2f}ms)]",
-                 g_tex_xfer.accel_tc, g_tex_xfer.accel_tc_ns / 1.0e6,
-                 g_tex_xfer.sw_tc, g_tex_xfer.sw_tc_ns / 1.0e6,
-                 g_tex_xfer.accel_dt, g_tex_xfer.accel_dt_ns / 1.0e6,
-                 g_tex_xfer.sw_dt, g_tex_xfer.sw_dt_ns / 1.0e6,
-                 g_tex_xfer.accel_mf, g_tex_xfer.accel_mf_ns / 1.0e6,
-                 g_tex_xfer.sw_mf, g_tex_xfer.sw_mf_ns / 1.0e6);
-        g_gpu_exec = GpuExecCounters{};
-        g_tex_xfer = TexXferCounters{};
     }
 }
 
