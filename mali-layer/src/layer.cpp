@@ -672,16 +672,24 @@ void apply_mali_patches() {
     // the function branches to 0x9e50a0 which handles "this slot's empty,
     // try the next index". We mimic that path for a NULL pointer.
     //
-    //   cbnz  x15, .have        ; pointer non-null → normal load
-    //   b     0x9e50a0          ; null → take Mali's own "skip-slot" branch
+    // Upgrade 2026-04-19: the cbnz-only guard let near-null garbage through.
+    // Observed crash at tramp3+8 (pc 0x1f62f68) with fault addr 0x2f — x15
+    // arrived as 0x27, survived cbnz, faulted on [x15, #8]. Same class of bug
+    // that patches 6/7/8 already handle via a 0x1000 bounds check. Upgrade to
+    // match: treat <16MB as "skip-slot" (same branch target as null).
+    //
+    //   cmp   x15, #0x1000, LSL 12
+    //   b.hs  .have               ; valid pointer → normal load
+    //   b     0x9e50a0             ; null/near-null → Mali's "skip-slot" branch
     // .have:
-    //   ldr   x14, [x15, #8]    ; original load
-    //   b     0x9e505c          ; resume
-    const uint32_t tramp3[4] = {
-        0xb500004f,   // cbnz  x15, +8  (to .have)
-        0x17aa084f,   // b     0x9e50a0
+    //   ldr   x14, [x15, #8]       ; original load
+    //   b     0x9e505c              ; resume
+    const uint32_t tramp3[5] = {
+        0xf14005ff,   // cmp   x15, #0x1000, LSL 12
+        0x54000042,   // b.hs  +8       (to .have)
+        0x17aa084e,   // b     0x9e50a0  (PC shifted +4 from old → imm26 -1)
         0xf94005ee,   // ldr   x14, [x15, #8]
-        0x17aa083c,   // b     0x9e505c
+        0x17aa083b,   // b     0x9e505c  (PC shifted +4 from old → imm26 -1)
     };
     // Patch at 0x9e5058: b 0x1f62f60
     const uint32_t patch3 = 0x1455f7c2;
@@ -868,7 +876,7 @@ void apply_mali_patches() {
     if (!write_patch(crash8, &patch8, sizeof(patch8))) return;
 
     g_mali_patched = true;
-    LOGI("patch: Mali G52 null-check trampolines installed (7 sites: 1-4 + 6,7,8)");
+    LOGI("patch: Mali G52 null-check trampolines installed (7 sites: 1-4 + 6,7,8) [p3-bounds-v2]");
 }
 
 // -------- Hang watchdog --------
